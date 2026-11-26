@@ -32,6 +32,8 @@ $lowMemory = @{
     VICTORY_TEXTURE_STAGE_MB          = '256'
     # Textures are uploaded ahead of need less often (default 12 ms a frame).
     VICTORY_EARLY_TEXTURES_MS         = '6'
+    # Bytes of picked views checked per frame (default 32): less CPU time and memory traffic each frame.
+    VICTORY_PICKED_MB                 = '8'
     # Budgets of the smaller PC: the layer's residency logic uses its small-machine limits.
     VICTORY_RESIDENCY_LIMITED         = '1'
 }
