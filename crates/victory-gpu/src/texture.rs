@@ -41,8 +41,9 @@ pub(crate) struct Staging {
     base: u64,
     /// Back in the pool with the last list that names it.
     _piece: Option<crate::pool::StagingPiece>,
-    /// Its bytes.
+    /// Its bytes (kept for the diagnostics build; nothing reads it yet).
     #[cfg(feature = "diagnostics")]
+    #[allow(dead_code)]
     size: u64,
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,

@@ -1130,6 +1130,15 @@ fn create() -> windows::core::Result<Host> {
 }
 
 impl Host {
+    /// Whether the host device is on a software adapter (WARP, the Basic Render Driver).
+    #[cfg(test)]
+    pub(crate) fn is_software(&self) -> bool {
+        let desc = self.adapter.as_ref().and_then(|a| unsafe { a.GetDesc1() }.ok());
+        desc.is_some_and(|d| {
+            d.Flags & windows::Win32::Graphics::Dxgi::DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 || d.VendorId == 0x1414
+        })
+    }
+
     /// The driver's version, as the system counts it (0: not known).
     pub(crate) fn driver(&self) -> i64 {
         let adapter = self.adapter.as_ref();
