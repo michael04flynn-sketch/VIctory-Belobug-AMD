@@ -561,29 +561,82 @@ fn scissor_test() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_SCISSOR_TEST").as_deref() == Ok("full"))
 }
 
-/// An experiment on mesh draws (`VICTORY_MESH_TEST`): 1 for `skip` (none
-/// is issued), 2 for `scissor` (each runs its shaders but rasterises one
-/// pixel), 0 otherwise. It tells a card hung by a mesh shader from one hung
-/// by what the shader's triangles cover.
+/// What `VICTORY_MESH_TEST` (`value`) and the adapter say about mesh draws:
+/// 1 for `skip` (none is issued), 2 for `scissor` (each runs its shaders but
+/// rasterises one pixel), 0 for the rest: `off`, a `keep:` or `only:` filter
+/// (see [`mesh_kept`]), and nothing said on a card that takes them.
+///
+/// Nothing said on an Intel adapter is `skip`: the Arc B390 (driver
+/// 32.0.101.8724) stopped within a minute or two of the world in 26 of the
+/// 27 runs of the session of 2026-11-27 that issued mesh draws, whichever of
+/// the title's mesh shaders were drawn and with each switch tried that
+/// leaves them drawn, and in none of the 3 that issued none (to 200 s).
+/// `docs/intel-arc.md` has the experiments. `VICTORY_MESH_TEST=off` issues
+/// them.
+fn mesh_mode(value: Option<&str>, intel: bool) -> u8 {
+    match value {
+        Some("skip") => 1,
+        Some("scissor") => 2,
+        Some(_) => 0,
+        None => u8::from(intel),
+    }
+}
+
+/// [`mesh_mode`] for this run.
 fn mesh_test() -> u8 {
     static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("VICTORY_MESH_TEST").as_deref() {
-        Ok("skip") => 1,
-        Ok("scissor") => 2,
-        _ => 0,
+    *ON.get_or_init(|| {
+        let value = std::env::var("VICTORY_MESH_TEST").ok();
+        let mode = mesh_mode(value.as_deref(), crate::host::intel());
+        if value.is_none() && mode == 1 {
+            tracing::warn!(
+                "mesh draws are not issued on this Intel adapter (they stop the card within a minute or two of the world, \
+                 docs/intel-arc.md); VICTORY_MESH_TEST=off issues them"
+            );
+        }
+        mode
     })
+}
+
+/// Experiments on direct mesh dispatches, by switch: `VICTORY_MESH_ZERO=1`
+/// issues them with no groups (everything bound, no shader runs: a hang
+/// that stays is in the pipeline's state, not in what the shaders do) and
+/// `VICTORY_MESH_FENCE=1` puts a barrier on all work and memory after each
+/// (a hang that goes is a race between draws, or with other work).
+fn mesh_flag(name: &'static str) -> bool {
+    static FLAGS: std::sync::OnceLock<[bool; 2]> = std::sync::OnceLock::new();
+    let on = |n: &str| std::env::var_os(n).is_some_and(|v| v == "1");
+    let flags = FLAGS.get_or_init(|| [on("VICTORY_MESH_ZERO"), on("VICTORY_MESH_FENCE")]);
+    match name {
+        "VICTORY_MESH_ZERO" => flags[0],
+        _ => flags[1],
+    }
+}
+
+/// Which mesh draws `VICTORY_MESH_TEST` keeps (see [`mesh_kept`]).
+enum Keep {
+    /// `keep:<hex digits>[:<hex digits>]`: the last digits of the hash, and
+    /// the digits before them if given.
+    Digits(String, String),
+    /// `only:<hash>,<hash>...`: the shaders with these 16-digit hashes.
+    Only(Vec<String>),
 }
 
 /// `VICTORY_MESH_TEST=keep:<hex digits>[:<hex digits>]`: only the mesh
 /// draws whose mesh shader's hash ends in one of the first digits (and
 /// whose digit before it is one of the second, if given) are issued: a
-/// search for the shaders that stop the card.
+/// search for the shaders that stop the card. `only:<hash>,<hash>...`
+/// issues the draws of those mesh shaders alone.
 fn mesh_kept(pipeline: usize) -> bool {
-    static KEEP: std::sync::OnceLock<Option<(String, String)>> = std::sync::OnceLock::new();
-    let Some((last, before)) = KEEP.get_or_init(|| {
+    static KEEP: std::sync::OnceLock<Option<Keep>> = std::sync::OnceLock::new();
+    let Some(keep) = KEEP.get_or_init(|| {
         let value = std::env::var("VICTORY_MESH_TEST").ok()?;
+        if let Some(list) = value.strip_prefix("only:") {
+            let hashes = list.split(',').map(|h| h.trim().to_owned()).filter(|h| !h.is_empty());
+            return Some(Keep::Only(hashes.collect()));
+        }
         let mut parts = value.strip_prefix("keep:")?.split(':');
-        Some((parts.next()?.to_owned(), parts.next().unwrap_or("").to_owned()))
+        Some(Keep::Digits(parts.next()?.to_owned(), parts.next().unwrap_or("").to_owned()))
     }) else {
         return true;
     };
@@ -597,7 +650,12 @@ fn mesh_kept(pipeline: usize) -> bool {
     if hash.len() < 16 {
         return true;
     }
-    last.as_bytes().contains(&hash[15]) && (before.is_empty() || before.as_bytes().contains(&hash[14]))
+    match keep {
+        Keep::Digits(last, before) => {
+            last.as_bytes().contains(&hash[15]) && (before.is_empty() || before.as_bytes().contains(&hash[14]))
+        }
+        Keep::Only(hashes) => hashes.iter().any(|h| h.as_bytes() == &hash[..16]),
+    }
 }
 
 /// Draws recorded on the host GPU since the last frame line.
@@ -3356,7 +3414,11 @@ impl State {
                         once!(x, "a mesh dispatch of more groups than the host takes: cut");
                     }
                     // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
+                    unsafe { l6.DispatchMesh(if mesh_flag("VICTORY_MESH_ZERO") { 0 } else { x.min(65_535) }, 1, 1) };
+                    // An experiment: nothing overlaps the dispatch (`VICTORY_MESH_FENCE=1`).
+                    if mesh_flag("VICTORY_MESH_FENCE") {
+                        crate::host::sync_all(&list.list);
+                    }
                     self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -4798,7 +4860,22 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::staging_budget_per_frame;
+    use super::{mesh_mode, staging_budget_per_frame};
+
+    /// Mesh draws are on where nothing is said, except on an Intel adapter, where
+    /// they are off; what is said wins either way.
+    #[test]
+    fn mesh_draws_are_off_by_default_on_intel_only() {
+        assert_eq!(mesh_mode(None, false), 0);
+        assert_eq!(mesh_mode(None, true), 1);
+        for intel in [false, true] {
+            assert_eq!(mesh_mode(Some("skip"), intel), 1);
+            assert_eq!(mesh_mode(Some("scissor"), intel), 2);
+            assert_eq!(mesh_mode(Some("off"), intel), 0);
+            assert_eq!(mesh_mode(Some("keep:01"), intel), 0);
+            assert_eq!(mesh_mode(Some("only:0123456789abcdef"), intel), 0);
+        }
+    }
 
     #[test]
     fn staging_budget_scales_with_vram_budget() {

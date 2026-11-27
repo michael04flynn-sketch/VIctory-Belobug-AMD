@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::UserData;
-use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
+use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, Ty, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
 use crate::ShaderError;
@@ -7172,9 +7172,7 @@ impl<'a> Lower<'a> {
         } else {
             self.s.m.undef(i32t)
         };
-        let d = self
-            .s
-            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+        let d = self.get_dimensions(c, dims, h, mip);
         let field = |l: &mut Self, k: u32| l.s.m.extract(c, d, k);
         let words: Vec<(u32, V)> = match image {
             Some(kind) => {
@@ -7431,6 +7429,22 @@ impl<'a> Lower<'a> {
         }
         // (Raw, so `raw_twin` gives the twin's index.)
         Ok(Some(self.handle(site, src, false, (11, 0))?))
+    }
+
+    /// `GetDimensions` of the handle `h` at level `mip`, as `dx.op.getDimensions`.
+    ///
+    /// `VICTORY_NO_GETDIMS=1` (a diagnostic, part of the cache key): the size is a constant
+    /// (256 by 256, one slice, one level) and the handle is not asked. Every pipeline whose device
+    /// removal on an Arc B390 named a mesh shader (`MS_VS_Transform*`, `MSNC_VS_TransformSkin`)
+    /// asks the size of a descriptor it picks from the heap at an index it loads, as a 1D or 2D
+    /// texture; whether the driver hangs on a descriptor of another kind there is what this asks.
+    fn get_dimensions(&mut self, c: usize, dims: Ty, h: V, mip: V) -> V {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *OFF.get_or_init(|| std::env::var_os("VICTORY_NO_GETDIMS").is_some_and(|v| v == "1")) {
+            let (w, one) = (self.s.m.i32(256), self.s.m.i32(1));
+            return self.s.m.aggregate(dims, &[w, w, one, one]);
+        }
+        self.s.op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip])
     }
 
     /// The dword at a computed byte address of a constant buffer.
@@ -11680,9 +11694,7 @@ impl<'a> Lower<'a> {
             };
             let i32t = self.s.t.i32;
             let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
-            let d = self
-                .s
-                .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+            let d = self.get_dimensions(c, dims, h, mip);
             let one = self.s.m.i32(1);
             let present = match kind {
                 1 => [true, false, false, true],
@@ -11789,9 +11801,7 @@ impl<'a> Lower<'a> {
                 let i32t = self.s.t.i32;
                 let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
                 let z = self.s.m.i32(0);
-                let d = self
-                    .s
-                    .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, z]);
+                let d = self.get_dimensions(c, dims, h, z);
                 for (k, slot) in cs.iter_mut().enumerate().take(spatial) {
                     let n = self.s.m.extract(c, d, k as u32);
                     let n = self.s.m.cast(c, Cast::UiToFp, n, self.s.t.f32);
@@ -11986,9 +11996,7 @@ impl<'a> Lower<'a> {
                     let i32t = self.s.t.i32;
                     let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
                     let z = self.s.m.i32(0);
-                    let d = self
-                        .s
-                        .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, z]);
+                    let d = self.get_dimensions(c, dims, h, z);
                     let width = self.s.m.extract(c, d, 0);
                     let width = self.s.m.cast(c, Cast::UiToFp, width, self.s.t.f32);
                     let texels = self.s.m.bin(c, Bin::Mul, longer, width);
@@ -12077,9 +12085,7 @@ impl<'a> Lower<'a> {
                         let lod = self.unary(26, lod); // round to nearest
                         let mip = self.s.m.cast(c, Cast::FpToUi, lod, i32t);
                         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
-                        let d = self
-                            .s
-                            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+                        let d = self.get_dimensions(c, dims, h, mip);
                         let half = self.s.m.f32(0.5f32.to_bits());
                         let one = self.s.m.f32(1.0f32.to_bits());
                         let (mut lo, mut hi) = ([iu; 2], [iu; 2]);

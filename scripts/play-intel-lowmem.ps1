@@ -55,7 +55,8 @@ param(
     # Device-removed data (VICTORY_D3D12_DRED, as scripts\play.ps1 sets it): light keeps what a
     # lost device was doing, so the log names the command and pipeline instead of "no
     # breadcrumbs". off leaves it out.
-    [ValidateSet('off', 'light', 'faults')][string]$Dred = 'light',
+    # (full: a text for every command, so the report says what the stopped copy or draw is; slower.)
+    [ValidateSet('off', 'light', 'full', 'faults')][string]$Dred = 'light',
     # The D3D12 debug layer (VICTORY_D3D12_DEBUG=1): a refused command is named. Slower; needs
     # Windows' "Graphics Tools" feature, and is ignored without it.
     [switch]$D3dDebug,
@@ -95,8 +96,11 @@ param(
     [string]$SkipPipelines,
     # The project's own search for what stops the card (VICTORY_MESH_TEST, diag build): scissor runs
     # every mesh draw's shaders but rasterises one pixel (a hang that stays is the mesh shader itself,
-    # one that goes is what its triangles cover); skip issues no mesh draw at all; keep:<digit> keeps
-    # only the mesh draws whose shader hash ends in that digit.
+    # one that goes is what its triangles cover); skip issues no mesh draw at all; keep:<digits> keeps
+    # only the mesh draws whose shader hash ends in one of those digits (keep:<digits>:<digits>: and the
+    # digit before it is one of the second set); only:<hash>,<hash> keeps the draws of those mesh
+    # shaders alone; off draws them all (the host's default on an Intel GPU is skip: the card stops on
+    # them, docs\intel-arc.md).
     [string]$MeshTest,
     # Where the log goes (default: logs\ in the repository). -NoLog writes none.
     [string]$LogDir,
@@ -156,9 +160,15 @@ if ($SkipFsr4) {
     $fsr4 = '32aa8384586e0f12,3d147e8190574516,47d8c225abfcb246,528278df1274cb33,55c46e739fa0796a,6a6c7b7fde59134f,80a0178d3a9d8d12,85dea520c893a3d9,8cbd7f5b9ce7530c,8e614708143ef917,8fb5e4aa9c542c3f,ba578b59c8c28a57,c99e30956be0deaf,f46117391dd81461,f5ab5dcf95536794,f7fc6c984427fef3,fdce2a0a9fb1521a,17af85f170e66f30,477b52e73ddeb6f2,8b437ab61d8008fe'
     $SkipPipelines = if ($SkipPipelines) { "$SkipPipelines,$fsr4" } else { $fsr4 }
 }
-if ($MeshTest) { $lowMemory['VICTORY_MESH_TEST'] = $MeshTest }
+if ($MeshTest) {
+    $lowMemory['VICTORY_MESH_TEST'] = $MeshTest
+} else {
+    # (The host's own default on an Intel adapter, said here because the picture shows it: the world's
+    # meshes are missing. 26 of 27 runs that drew them stopped the card; 3 of 3 that did not, ran on.)
+    Write-Host 'Mesh draws are skipped on this Intel GPU (they stop it within a minute or two of the world: docs\intel-arc.md). -MeshTest off draws them anyway.'
+}
 if ($SkipPipelines) { $lowMemory['VICTORY_SKIP_PIPELINES'] = $SkipPipelines }
-if ($Dred -ne 'off') { $lowMemory['VICTORY_D3D12_DRED'] = $Dred }
+if ($Dred -eq 'full') { $lowMemory['VICTORY_D3D12_DRED'] = '1' } elseif ($Dred -ne 'off') { $lowMemory['VICTORY_D3D12_DRED'] = $Dred }
 if ($D3dDebug) { $lowMemory['VICTORY_D3D12_DEBUG'] = '1' }
 if ($Probe) { $lowMemory['VICTORY_INPLACE_PROBE'] = '1' }
 $lowMemory['VICTORY_UMA_RESERVE_MB'] = [string]$ReserveMB
@@ -341,6 +351,15 @@ if ($logPath -and (Test-Path $logPath)) {
                 Write-Host '  -MeshTest skip      (no mesh draws at all)'
                 Write-Host '  -SkipFsr4           (the FidelityFX FSR4 compute passes: created 10 to 33 s before every hang so far)'
                 Write-Host '  scripts\intel-sweep.ps1 runs the whole list one after the other and prints which settings survive.'
+            } elseif ($tail -match 'the first uncompleted is command index (\d+) \(op (\d+)\) of "([^"]*)"') {
+                # Not a draw the report can name: say what kind of command it is (D3D12 breadcrumb ops).
+                $ops = @{ 3 = 'DrawInstanced'; 4 = 'DrawIndexedInstanced'; 5 = 'ExecuteIndirect'; 6 = 'Dispatch'; 7 = 'CopyBufferRegion'
+                          8 = 'CopyTextureRegion'; 9 = 'CopyResource'; 12 = 'ClearRenderTargetView'; 13 = 'ClearUnorderedAccessView'
+                          14 = 'ClearDepthStencilView'; 15 = 'ResourceBarrier'; 42 = 'DispatchMesh' }
+                $op = [int]$Matches[2]
+                $name = if ($ops.ContainsKey($op)) { $ops[$op] } else { "op $op" }
+                Write-Host "Device-removed data: the first unfinished command is $($Matches[1]) of $($Matches[3]), a $name."
+                Write-Host '  (With -Dred full the report says what such a copy or draw is. Hangs have named ExecuteIndirect, DispatchMesh and CopyTextureRegion; the run with no mesh draws at all (-MeshTest skip) did not hang.)'
             } elseif ($tail -match 'command (\d+) ran (\[[^\]]+\])') {
                 Write-Host "Device-removed data: near command $($Matches[1]), running $($Matches[2])."
             }
