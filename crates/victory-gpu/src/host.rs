@@ -9933,7 +9933,13 @@ impl Host {
             let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
             showing.next("the frame meter");
             if status == windows::Win32::Foundation::S_OK {
-                p.panel.frame(p.meter.line_due());
+                // The panel is a display aid: a failure in it must not end the run (a panic here
+                // cannot unwind and aborts the process).
+                let due = p.meter.line_due();
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.panel.frame(due))).is_err() {
+                    static SAID: std::sync::Once = std::sync::Once::new();
+                    SAID.call_once(|| tracing::error!("the panel failed (see the panic above); the run goes on"));
+                }
             }
             let presented = p.meter.record_present(p.hwnd, status);
             showing.end();

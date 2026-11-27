@@ -66,6 +66,14 @@ Change made for it: on a UMA GPU the always-allowed texture host copies start at
 2 GiB (`VICTORY_TEXTURE_FLOOR_MB` sets it). That is about 1 GB less before the burst; not
 measured yet.
 
+## Third run (2026-11-27, with the 1 GiB texture floor)
+
+Ended at 36 s, frame 734, before the first world frame, so the floor change is still untested.
+Cause: a panic in the performance panel (`VICTORY_PANEL=1`), `clamp(0, -156250)` in the per-core
+CPU meter: a core's counters went backwards between two looks (a parked core on a hybrid CPU).
+A panic there cannot unwind and aborted the process (exit 0xC0000409). Fixed: such a look counts
+as an idle core, and a panel failure is caught and logged instead of ending the run.
+
 ## Not known yet
 
 - Whether the process itself or other programs took the RAM (the `.mem.csv` of the next run).
