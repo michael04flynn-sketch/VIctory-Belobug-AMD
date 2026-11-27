@@ -5,7 +5,7 @@
 #   scripts\play-intel-lowmem.ps1 -Exe <path of your own copy's executable>
 # -Build        release (the default, faster) or diag
 # -InPlace      use title memory in place instead of copying it (VICTORY_INPLACE=1)
-# -MinFreeGB    free RAM below which the run is not started (default 14); -Force starts anyway
+# -MinFreeGB    free RAM below which the run is not started (default 20); -Force starts anyway
 # -LogDir / -NoLog   the run is logged to logs\victory-<time>.log (newest 20 kept) with a header
 #               (command, git commit, GPU and driver, env values) and an exit-code summary
 # Extra settings may be passed the same way as play.ps1: -More @{VICTORY_PANEL='1'}
@@ -16,7 +16,9 @@ param(
     [ValidateSet('diag', 'release')][string]$Build = 'release',
     [hashtable]$More = @{},
     # Free RAM (GB) below which the run is not started (-Force: start anyway).
-    [double]$MinFreeGB = 14,
+    # (20: the run of 2026-11-27 started with 17.9 GB free on 31 GB and ended with the card out
+    # of memory in the first world frame, with 2.9 GB free at that moment.)
+    [double]$MinFreeGB = 20,
     [switch]$Force,
     # Free commit (RAM + pagefile, GB) below which the run is not started.
     [double]$MinCommitGB = 20,
@@ -158,6 +160,15 @@ if (-not $NoLog) {
     Write-Host "Log: $logPath"
 }
 
+# Memory timeline next to the log (see memlog.ps1): free RAM and commit, and victory.exe's size.
+$sampler = $null
+if ($logPath) {
+    $memPath = [IO.Path]::ChangeExtension($logPath, '.mem.csv')
+    $sampler = Start-Process powershell -WindowStyle Hidden -PassThru -ArgumentList @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PSScriptRoot 'memlog.ps1'), '-Out', $memPath)
+    Write-Host "Memory timeline: $memPath"
+}
+
 $clock = [Diagnostics.Stopwatch]::StartNew()
 Push-Location $repo   # victory.toml is looked for here
 try {
@@ -170,6 +181,7 @@ try {
     }
 } finally {
     Pop-Location
+    if ($sampler -and -not $sampler.HasExited) { Stop-Process -Id $sampler.Id -Force -ErrorAction SilentlyContinue }
 }
 $exitCode = $LASTEXITCODE
 $clock.Stop()
@@ -177,6 +189,7 @@ $clock.Stop()
 # Exit code 0 is a clean exit. A large unsigned code is a Windows crash status.
 $meaning = switch ($exitCode) {
     0 { 'clean exit' }
+    -2005270523 { 'DXGI_ERROR_DEVICE_REMOVED (0x887A0005): the GPU device was lost, look for "out of memory" or "removed" just above' }
     -1073741819 { 'access violation (0xC0000005)' }
     -1073740791 { 'stack buffer overrun (0xC0000409)' }
     -1073741571 { 'stack overflow (0xC00000FD)' }

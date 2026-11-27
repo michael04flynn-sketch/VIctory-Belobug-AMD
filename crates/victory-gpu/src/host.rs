@@ -1099,6 +1099,7 @@ fn create() -> windows::core::Result<Host> {
             .CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE1, (&raw mut arch).cast(), size_of_val(&arch) as u32)
             .is_ok()
         {
+            crate::residency::set_uma(arch.UMA.as_bool());
             tracing::info!(
                 uma = arch.UMA.as_bool(),
                 cache_coherent_uma = arch.CacheCoherentUMA.as_bool(),

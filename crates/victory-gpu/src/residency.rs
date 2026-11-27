@@ -121,11 +121,24 @@ pub(crate) fn limited_host_ram() -> bool {
     })
 }
 
-fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
+/// Whether the GPU shares the PC's memory (an iGPU). Set once by the host at startup.
+static UMA: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_uma(uma: bool) {
+    UMA.store(uma, Ordering::Relaxed);
+}
+
+/// On a shared-memory GPU the card's memory is the PC's memory: the first world frame of the
+/// title adds several GB of card and buffer copies in one go, between two once-a-second looks
+/// (run of 2026-11-27: free RAM fell from 17.9 GB to 2.9 GB inside frame 1217, the pressure
+/// state came on at 2.9 GB, and the card then refused memory, E_OUTOFMEMORY, 1.3 s later).
+/// So pressure starts earlier there: under 6 GiB free (out again above 8) instead of 3 (5).
+fn next_pressure(was: bool, physical: u64, commit: u64, uma: bool) -> bool {
+    let (enter, leave) = if uma { (6 * GIB, 8 * GIB) } else { (3 * GIB, 5 * GIB) };
     if was {
-        physical < 5 * GIB || commit < 6 * GIB
+        physical < leave || commit < 6 * GIB
     } else {
-        physical <= 3 * GIB || commit <= 4 * GIB
+        physical <= enter || commit <= 4 * GIB
     }
 }
 
@@ -138,7 +151,7 @@ pub(crate) fn refresh() {
     let (physical, commit) = (status.ullAvailPhys, status.ullAvailPageFile);
     HEADROOM.store(physical.min(commit), Ordering::Relaxed);
     let was = pressured();
-    let pressure = next_pressure(was, physical, commit);
+    let pressure = next_pressure(was, physical, commit, UMA.load(Ordering::Relaxed));
     if pressure != was {
         PRESSURED.store(pressure, Ordering::Relaxed);
         if pressure {
@@ -211,12 +224,22 @@ mod tests {
 
     #[test]
     fn either_constraint_enters_pressure_and_both_must_recover() {
-        assert!(next_pressure(false, 12 * GIB, 4 * GIB));
-        assert!(next_pressure(false, 3 * GIB, 16 * GIB));
-        assert!(next_pressure(true, 4 * GIB, 7 * GIB));
-        assert!(next_pressure(true, 6 * GIB, 5 * GIB));
-        assert!(!next_pressure(true, 5 * GIB, 6 * GIB));
-        assert!(!next_pressure(false, 4 * GIB, 5 * GIB));
+        assert!(next_pressure(false, 12 * GIB, 4 * GIB, false));
+        assert!(next_pressure(false, 3 * GIB, 16 * GIB, false));
+        assert!(next_pressure(true, 4 * GIB, 7 * GIB, false));
+        assert!(next_pressure(true, 6 * GIB, 5 * GIB, false));
+        assert!(!next_pressure(true, 5 * GIB, 6 * GIB, false));
+        assert!(!next_pressure(false, 4 * GIB, 5 * GIB, false));
+    }
+
+    #[test]
+    fn a_shared_memory_gpu_enters_pressure_earlier_and_leaves_later() {
+        assert!(!next_pressure(false, 4 * GIB, 16 * GIB, false));
+        assert!(next_pressure(false, 4 * GIB, 16 * GIB, true));
+        assert!(next_pressure(false, 6 * GIB, 16 * GIB, true));
+        assert!(!next_pressure(false, 7 * GIB, 16 * GIB, true));
+        assert!(next_pressure(true, 7 * GIB, 16 * GIB, true));
+        assert!(!next_pressure(true, 8 * GIB, 16 * GIB, true));
     }
 
     #[test]
