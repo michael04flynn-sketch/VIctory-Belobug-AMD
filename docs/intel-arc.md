@@ -22,8 +22,13 @@ The card's memory is the PC's memory. Free RAM is the real limit, not the VRAM f
 ```powershell
 cargo build --locked --profile diag -p victory --features diagnostics
 target\diag\victory.exe shaders <the shader archives>
-scripts\play-intel-lowmem.ps1 -Exe <path of your copy's executable> -Build diag -Probe -More @{VICTORY_PANEL='1'}
+scripts\play-intel-lowmem.ps1 -Exe <path of your copy's executable> -Build diag -More @{VICTORY_PANEL='1'}
+scripts\intel-sweep.ps1 -Exe <path of your copy's executable>     # the settings below, one run each, unattended
 ```
+
+`-InPlace` and `-Probe` are no longer in the example: in place covered 350 MB of 6.8 GB of the
+title's memory (the rest is page-pool view memory the host cannot open), and the probe only
+reported that.
 
 Close browsers, remote-desktop tools and anything large first. The launcher refuses to start
 under 20 GB free RAM or 20 GB free commit (`-MinFreeGB`, `-MinCommitGB`, `-Force` overrides).
@@ -263,6 +268,77 @@ system's or, if less, what the process uses plus the free RAM less a reserve
 sweep that lets idle copies go both use it, so copies stop and idle ones go before the PC runs out.
 The profiles are Lean (cap 2,048 MB, 70 %), Balanced (no cap, 85 %, the default) and Fast (92 %).
 None of this has been run in game.
+
+## Tenth run (2026-11-27 01:33): textures better, frames 4 to 6 times faster, still the same end
+
+The ninth run's two texture causes are gone. Ended at 117 s, frame about 2,256, hung device again.
+
+- Waiting on the runtime: "texture refreshes ... waiting for title memory to hold still" is 0.0 ms
+  (13,486 ms before), with `VICTORY_TEXTURE_NO_WAIT=1`.
+- Copies: 21,930 title-filled host copies alive, 2,202 MB (10,760 and 1,088 MB with the hard cap),
+  "passes that made none for lack of room" 8 to 19 (599). The host's budget line shows it working:
+  "the card's budget is taken as 12,182 MB, not the system's 14,978 MB (in use 9,549 MB, free RAM
+  5,705 MB, reserve 3,072 MB)".
+- World frames: 1.0 to 1.2 s (3.7 to 6.6 s before), the card about 23 % busy. Lowest free RAM 4.5
+  GB, peak working set 20.8 GB.
+- Still 5,192 to 5,610 title textures (5.9 GB of title memory) with no host copy: the queue is at
+  its room again (used 9.6 GB against 85 % of 12.1 GB). The limit on this machine is RAM, and the
+  rest of the 9.5 GB in use (3.0 GB shared buffer copies, 3.2 GB texture blocks, 1.3 GB upload
+  buffers) is not the textures'.
+- The end: list 100 stopped at command 35, direct mesh dispatches (`a mesh dispatch of 1 groups`) of
+  `[mesh 45ace4127ac61cfd]` and its siblings, which are `MS_VS_CascadeShadows_draw_65459485_Wrapped`
+  (mesh-only, depth-only shadow cascade draws). The earlier hangs were `MS_VS_TransformD_c5fd36bb`
+  and `MS_VS_Transform_4dbafe93` (indirect, with a pixel shader). So the hang is in mesh draws
+  generally, at changing places.
+- A pattern in all four runs with device-removed data (7th to 10th): the title's FidelityFX FSR4
+  passes were created at world entry ("FFX FSR4 ACO: DeserializeComputePipelineStateX FAILED ...
+  falling back to NewBE"), 9.7, 20, 33 and 27 s before the device was removed, never after. The 17
+  compute shaders they run are not in the title's files (the loader builds them at run time) and the
+  same 17 hashes appear in every run; three more of them do not translate. Whether they have
+  anything to do with it is not known: a stray write of one of them would corrupt memory the later
+  draws read, and no page fault is reported (DRED has none for any run).
+
+### Offline, from the title's files (shaders.rpf, `victory.exe translate` on this GPU)
+
+None of this needs the game running. `VICTORY_TRANSLATE_ONLY=<hashes>` translates just those
+shaders, `--pipelines` makes their host pipelines on this GPU, `--validate` runs dxil.dll over
+them, `VICTORY_EMIT_DUMP=<dir outside the repo>` keeps the DXIL, and `dxc -dumpbin` (Windows SDK)
+reads it. `victory.exe shader-info -v` lists every shader by the hash a run's log uses.
+
+- 26,503 containers (614 duplicates), 26,084 programs: 12,056 pixel, 2,191 vertex, 8,765 mesh and
+  2,682 compute shaders. All translate.
+- The mesh shaders that hang are well formed: no barriers, `SetMeshOutputCounts` first and
+  uniform, outputs within the limit (one position, 128 vertices and primitives), and the host's
+  pipelines for them are created by this driver (checked for `45ace4127ac61cfd`, `d42a640660651285`,
+  `85eaffa59a3a6ecf`, `3c067b199b10fea2`). Nothing in the DXIL points at the hang.
+- `VICTORY_MESH_OUTPUT_STRICT=1` refuses 71 mesh shaders: the character families
+  `MS_VS_PedTransform*` and `MSNC_VS_PedTransformSkin*` with Fire, Decals and Transmission variants.
+  Without it they are emitted and the driver creates their pipelines (the validator says their
+  outputs pass 32 KiB). Three runs with it on hung all the same, so it is off again in the launcher
+  (`-MeshStrict` turns it on).
+- 195 geometry-stage programs (`GS_VoxelizeGeneric`) do not translate; the title does not use
+  them on this path.
+- Of the 2,682 compute programs 1,261 are translated for waves of 32 and 28 stay pinned to a wave of
+  64, which this GPU (waves 16 to 32) refuses at pipeline creation with "The parameter is
+  incorrect": they are the passes dropped every frame. Families: GpuParticleEmit
+  (`CS_Emit_Dynamic_Model_*`, `CS_EmitCounts_Dynamic_Edge`), GpuParticleUpdate `CS_Visibility`,
+  vfx_triangleClip (`CS_CollectTriangles*`, `CS_DefragHeap_ComputeRelocations`), proj_decal_trail
+  (build, pack, update, defrag), water_shading `CS_TransmissionVolumetrics*`, alphaResolve
+  `CS_AlphTransmissionPrefilterMip`, hair shadow masks (`..._SampleHairScreenSpace`) and
+  `CS_SpawnLiquidTrail_SampleDecalRaycastTriangleTest`. Missing: GPU particles, decal trails,
+  volumetric transmission (water), hair shadows. The translator keeps 64 for them because they
+  share LDS inside a console wave without barriers, read lanes (`v_readlane`, `v_mbcnt`) or use lane
+  masks as data; making them run in waves of 32 is translator work, not a setting.
+- The log's "host pipeline refused" line now says "wave size 64" for such a program.
+
+### Settings to tell the causes apart
+
+`scripts\intel-sweep.ps1` runs these one after another (each up to `-Seconds`, default 180) and
+prints which ones survive: the launcher as it is; `-SkipFsr4` (the 17 FSR4 compute shaders and the 3
+that do not translate are skipped); `VICTORY_RELAY=0` (every submission waited for); `-MeshTest
+scissor` (mesh shaders run, one pixel rasterised) and `skip` (no mesh draws); `-Profile Lean`; and
+`VICTORY_UMA_HEADROOM=0`. It closes a run still alive at the limit and counts it as survived, and
+leaves a `sweep-<time>.txt` and one log with a memory timeline per run in `logs\`.
 
 ## Not known yet
 

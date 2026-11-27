@@ -126,6 +126,21 @@ fn integer_format(f: DXGI_FORMAT) -> bool {
 /// integer format is not supported"), and its draws are lost. With one
 /// description for every target, each target gets its own copy so the
 /// others keep theirs.
+/// The wave size a translated shader pins (`WaveSize(n)`: its `PSV0` expects the same least and
+/// most lanes), if it pins one. A host whose waves are at most 32 lanes refuses 64 with "The
+/// parameter is incorrect": the Arc B390 does for compute programs of the title that need a console
+/// wave of 64 (`CS_Visibility`, `CS_DefragHeap_ComputeRelocations`, `CS_AlphTransmissionPrefilterMip`).
+fn pinned_wave(dxil: &[u8]) -> Option<u32> {
+    let container = victory_shader::Container::parse(dxil).ok()?;
+    let psv = container.part(victory_shader::FourCC::PSV0)?.data;
+    // The part: the size of the runtime info (a dword), then the info, whose fifth and sixth
+    // dwords are the least and the most lanes expected.
+    let info = psv.get(4..)?;
+    let least = u32::from_le_bytes(info.get(16..20)?.try_into().ok()?);
+    let most = u32::from_le_bytes(info.get(20..24)?.try_into().ok()?);
+    (least == most && least != 0).then_some(least)
+}
+
 fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D12_BLEND_DESC {
     let count = (targets.NumRenderTargets as usize).min(8);
     let per_target = blend.IndependentBlendEnable.as_bool();
@@ -616,8 +631,11 @@ impl HostPipeline {
             let parts: Vec<String> = (0..stages.len().min(3))
                 .filter_map(|i| stages.get(i).and_then(|(s, _)| s.translated()).map(|t| (i, t)))
                 .map(|(i, t)| {
+                    let wave = pinned_wave(&t.host.dxil).map_or(String::new(), |n| {
+                        format!(", wave size {n} (a host whose waves are at most 32 lanes refuses 64)")
+                    });
                     format!(
-                        "stage {i}: dxil {} B, user data {} dwords, root cbv/srv/uav {}/{}/{}, static samplers {}",
+                        "stage {i}: dxil {} B, user data {} dwords, root cbv/srv/uav {}/{}/{}, static samplers {}{wave}",
                         t.host.dxil.len(),
                         t.host.user_data_dwords(),
                         t.host.root_cbvs.len(),
@@ -1225,6 +1243,38 @@ mod tests {
         let mut t = targets(&[DXGI_FORMAT_R8G8B8A8_UNORM]);
         t.RTFormats[1] = DXGI_FORMAT_R8_UINT;
         assert_eq!(host_blend(&blending(false), &t), blending(false));
+    }
+
+    /// A container with one `PSV0` part whose info asks for these lanes.
+    fn container_with_lanes(least: u32, most: u32) -> Vec<u8> {
+        let mut info = vec![0u8; 48];
+        info[16..20].copy_from_slice(&least.to_le_bytes());
+        info[20..24].copy_from_slice(&most.to_le_bytes());
+        let mut part = 48u32.to_le_bytes().to_vec();
+        part.extend(&info);
+        let offset = 0x24u32;
+        let mut out = b"DXBC".to_vec();
+        out.extend([0u8; 16]);
+        out.extend([1, 0, 0, 0]);
+        out.extend(0u32.to_le_bytes()); // the total, patched below
+        out.extend(1u32.to_le_bytes());
+        out.extend(offset.to_le_bytes());
+        out.extend(b"PSV0");
+        out.extend((part.len() as u32).to_le_bytes());
+        out.extend(&part);
+        let total = out.len() as u32;
+        out[0x18..0x1c].copy_from_slice(&total.to_le_bytes());
+        out
+    }
+
+    /// `WaveSize(n)` shows as the same least and most lanes in `PSV0`; no pin shows as 0 and no limit.
+    #[test]
+    fn a_pinned_wave_size_is_read_from_the_psv() {
+        assert_eq!(pinned_wave(&container_with_lanes(64, 64)), Some(64));
+        assert_eq!(pinned_wave(&container_with_lanes(32, 32)), Some(32));
+        assert_eq!(pinned_wave(&container_with_lanes(0, u32::MAX)), None);
+        assert_eq!(pinned_wave(&container_with_lanes(16, 32)), None);
+        assert_eq!(pinned_wave(b"not a container"), None);
     }
 
     const VS: &str = "float4 main(uint i : SV_VertexID) : SV_Position {
