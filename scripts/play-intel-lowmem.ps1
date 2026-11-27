@@ -188,7 +188,7 @@ $sampler = $null
 if ($logPath) {
     $memPath = [IO.Path]::ChangeExtension($logPath, '.mem.csv')
     $sampler = Start-Process powershell -WindowStyle Hidden -PassThru -ArgumentList @(
-        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PSScriptRoot 'memlog.ps1'), '-Out', $memPath)
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $PSScriptRoot 'memlog.ps1')`"", '-Out', "`"$memPath`"")   # quoted: a path may hold spaces
     Write-Host "Memory timeline: $memPath"
 }
 
@@ -238,9 +238,11 @@ if ($writer) {
     $writer.WriteLine("# $summary")
     $writer.WriteLine("# free RAM after: $after GB")
     $writer.Close()
-    # Keep the newest 20 logs.
+    # Keep the newest 20 logs, and drop the memory timelines of the ones that go.
     Get-ChildItem $LogDir -Filter 'victory-*.log' | Sort-Object LastWriteTime -Descending |
-        Select-Object -Skip 20 | Remove-Item -ErrorAction SilentlyContinue
+        Select-Object -Skip 20 | ForEach-Object {
+            Remove-Item $_.FullName, ([IO.Path]::ChangeExtension($_.FullName, '.mem.csv')) -ErrorAction SilentlyContinue
+        }
     Write-Host "Log saved: $logPath"
 }
 exit $exitCode
