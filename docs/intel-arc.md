@@ -110,6 +110,25 @@ points at the memory timeline. Pipeline-library notes: 40 of 61,293 pages of the
 read as zeros and some pipelines were remade ("The parameter is incorrect", 0x80070057); not
 shown to matter.
 
+## Sixth run (2026-11-27, device-removed data on)
+
+Ended at 64 s, frame 1252, hung device (0x887A0006) again; RAM was fine (free never under 6.2 GB
+until the process died, working set 18.6 GB). `TdrDelay` is not set on this machine (2 s).
+
+- DRED names the list: list 448 of 689 had finished 53 of its 86 commands. The commands around
+  the stop are indirect mesh executions (kind 10, max 1), for example
+  `[mesh 3c067b199b10fea2, pixel 3ec62ecabb36f1d2]`, `[mesh 85eaffa59a3a6ecf, pixel b352dd911b665364]`,
+  `[mesh 53a2a19cf91c6088, pixel 8b901a7fb38c169b]`. The device-removed report gives the page of
+  each command's view slots; those slots are placed buffers in title memory.
+- Frames at that point took 0.35 to 3.1 s (frame 1244: 3.1 s); the removal came 3.6 s after frame
+  1252 began, with the submitting thread 3.3 s into one list. So a single list running past the
+  2 s timeout is the likeliest reading, but a bad command is not excluded: the data does not say
+  which. The test that tells them apart is a larger `TdrDelay` (30): if the run then goes on, it
+  was slowness.
+
+The launcher now notes a low `TdrDelay` before the run (read-only) and prints the first command
+the device-removed data names after a hang.
+
 ## Not known yet
 
 - Whether the process itself or other programs took the RAM (the `.mem.csv` of the next run).
