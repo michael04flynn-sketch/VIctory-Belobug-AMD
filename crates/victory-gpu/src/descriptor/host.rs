@@ -1541,6 +1541,24 @@ fn raw_twins() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_RAW_VIEWS").is_none_or(|v| v != "0"))
 }
 
+/// The largest view heap, in views, that `fits` between `low` (taken as fine) and `high` (known
+/// to be refused): the range is halved until it is under 16,384 views wide, so at most seven
+/// heaps are made and let go. A host that takes more than [`PORTABLE_VIEWS`] but not
+/// [`UNCAPPED_VIEWS`] (an Arc B390: it refused 2^21 and 2^22) keeps what it can take, where it
+/// had the portable size and the title's slots past it read the null slot.
+fn largest_view_heap(low: u32, high: u32, fits: &dyn Fn(u32) -> bool) -> u32 {
+    let (mut ok, mut no) = (low, high);
+    while no.saturating_sub(ok) > 16_384 {
+        let mid = ok + (no - ok) / 2;
+        if fits(mid) {
+            ok = mid;
+        } else {
+            no = mid;
+        }
+    }
+    ok
+}
+
 /// Picks, once, the null slot at the end of every host view heap and tells
 /// the translator now (`set_view_heap_limit`) instead of when the title's
 /// heap is made: a shader keeps the limit it was translated with, and the
@@ -1585,7 +1603,7 @@ pub(crate) fn probe_view_limit() {
         } else if fits(UNCAPPED_VIEWS) {
             UNCAPPED_VIEWS
         } else {
-            PORTABLE_VIEWS
+            largest_view_heap(PORTABLE_VIEWS, UNCAPPED_VIEWS, &fits)
         };
         tracing::info!(
             views,
@@ -6162,4 +6180,29 @@ pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
 /// for every table).
 pub(crate) fn list_views() -> bool {
     crate::toggled!("VICTORY_LIST_VIEWS")
+}
+
+#[cfg(test)]
+mod view_heap_search_tests {
+    use super::*;
+
+    #[test]
+    fn the_largest_heap_the_host_takes_is_found_within_a_range_of_16384() {
+        // A host that takes up to `limit` views.
+        for limit in [1_000_000u32, 1_048_576, 1_310_720, 1_507_328, 2_000_000, UNCAPPED_VIEWS - 1] {
+            let found = largest_view_heap(PORTABLE_VIEWS, UNCAPPED_VIEWS, &|n| n <= limit);
+            assert!(found <= limit, "{found} is more than the host takes ({limit})");
+            assert!(limit - found <= 16_384, "{found} is far under {limit}");
+            assert!(found >= PORTABLE_VIEWS);
+        }
+        // A host that takes less than the portable size: the portable size, as before.
+        assert_eq!(largest_view_heap(PORTABLE_VIEWS, UNCAPPED_VIEWS, &|n| n <= 500_000), PORTABLE_VIEWS);
+        // At most seven heaps are made.
+        let made = std::cell::Cell::new(0);
+        largest_view_heap(PORTABLE_VIEWS, UNCAPPED_VIEWS, &|n| {
+            made.set(made.get() + 1);
+            n <= 1_300_000
+        });
+        assert!(made.get() <= 7, "{} heaps made", made.get());
+    }
 }
