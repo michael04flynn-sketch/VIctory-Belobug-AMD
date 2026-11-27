@@ -129,6 +129,33 @@ until the process died, working set 18.6 GB). `TdrDelay` is not set on this mach
 The launcher now notes a low `TdrDelay` before the run (read-only) and prints the first command
 the device-removed data names after a hang.
 
+## Seventh run (2026-11-27, `TdrDelay` 30 read by the host)
+
+Ended at 58 s, frame 1142, hung device (0x887A0006) again. Both runs with device-removed data
+(the sixth and this one) name the same draw as the first command that did not finish:
+
+| Run | List | Done / recorded | First unfinished command |
+|---|---|---|---|
+| sixth | 448 of 689 | 53 / 86 | 53: `[mesh 85eaffa59a3a6ecf, pixel b352dd911b665364]` |
+| seventh | 485 of 735 | 48 / 90 | 48: `[mesh 85eaffa59a3a6ecf, pixel b352dd911b665364]` |
+
+It is an indirect mesh execution (kind 10, max 1) that reads a 43 MB placed buffer (895,654
+elements of 48 bytes) and a 998,400-byte one; the commands around it (`3c067b199b10fea2`,
+`53a2a19cf91c6088`, `8321022826281144`) use the same views.
+
+- The same draw in two runs points at a fault in that draw, not at load. The hang was reported
+  3.2 to 3.7 s into the list in every run, including this one with `TdrDelay` 30 in the registry;
+  whether that value was in force in Windows (it is read at start-up) is not known, so slowness is
+  not ruled out by this alone.
+- `lower.rs` marks a known gap (`mesh_prologue`): a mesh shader whose outputs pass the host's 32 KiB
+  even at its lane count is emitted anyway ("drivers take them; refuse them here if one hangs").
+  Whether `85eaffa59a3a6ecf` is such a shader is not established.
+
+Experiments, both in the launcher: `-MeshStrict` is on by default (`-NoMeshStrict` turns it off;
+`VICTORY_MESH_OUTPUT_STRICT=1`): such shaders are refused and their draws dropped. `-SkipPipelines
+85eaffa59a3a6ecf` skips that shader's draws (diag build) to test whether it is the one. After a hang
+the launcher prints the first unfinished command and its pipeline from the log.
+
 ## Not known yet
 
 - Whether the process itself or other programs took the RAM (the `.mem.csv` of the next run).
