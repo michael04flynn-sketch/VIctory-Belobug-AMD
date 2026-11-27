@@ -803,6 +803,154 @@ fn log_memory_map() {
     );
 }
 
+/// Live bytes of the buffers in system memory that the host makes: upload
+/// buffers (`[0]`) and shared buffers (`[1]`). Counted up when a buffer is
+/// made and down when its resource is released ([`track_buffer`]).
+static BUFFER_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// The same, as a count of buffers.
+static BUFFER_COUNT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A COM object that the resource holds as private data: D3D12 releases it
+/// when the resource is destroyed, and its last release says the buffer is
+/// gone.
+#[repr(C)]
+struct Gone {
+    methods: &'static [*const (); 3],
+    references: std::sync::atomic::AtomicU32,
+    kind: usize,
+    bytes: u64,
+}
+
+struct GoneMethods([*const (); 3]);
+// SAFETY: function addresses only.
+unsafe impl Sync for GoneMethods {}
+static GONE: GoneMethods = GoneMethods([gone_query as *const (), gone_add_ref as *const (), gone_release as *const ()]);
+
+unsafe extern "system" fn gone_query(
+    this: *mut std::ffi::c_void,
+    iid: *const windows::core::GUID,
+    out: *mut *mut std::ffi::c_void,
+) -> windows::core::HRESULT {
+    // SAFETY: COM's arguments.
+    unsafe {
+        if out.is_null() {
+            return windows::core::HRESULT(0x8000_4003_u32 as i32);
+        }
+        if iid.as_ref().is_some_and(|iid| *iid == <windows::core::IUnknown as windows::core::Interface>::IID) {
+            gone_add_ref(this);
+            *out = this;
+            return windows::core::HRESULT(0);
+        }
+        *out = std::ptr::null_mut();
+    }
+    windows::core::HRESULT(0x8000_4002_u32 as i32)
+}
+
+unsafe extern "system" fn gone_add_ref(this: *mut std::ffi::c_void) -> u32 {
+    // SAFETY: one of ours, alive while a reference to it is.
+    unsafe { (*this.cast::<Gone>()).references.fetch_add(1, Relaxed) + 1 }
+}
+
+unsafe extern "system" fn gone_release(this: *mut std::ffi::c_void) -> u32 {
+    // SAFETY: as above; the last reference frees the box it was made as.
+    unsafe {
+        let left = (*this.cast::<Gone>()).references.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) - 1;
+        if left == 0 {
+            let gone = Box::from_raw(this.cast::<Gone>());
+            BUFFER_BYTES[gone.kind].fetch_sub(gone.bytes, Relaxed);
+            BUFFER_COUNT[gone.kind].fetch_sub(1, Relaxed);
+        }
+        left
+    }
+}
+
+/// Counts `buffer` (`kind` 0: upload, 1: shared, of `bytes`) as live until
+/// its resource is released.
+pub(crate) fn track_buffer(buffer: &windows::Win32::Graphics::Direct3D12::ID3D12Resource, kind: usize, bytes: u64) {
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D12::ID3D12Object;
+    // (Two kinds are counted; `gone_release` could not survive another.)
+    if kind >= BUFFER_BYTES.len() {
+        return;
+    }
+    let Ok(object) = buffer.cast::<ID3D12Object>() else { return };
+    const KEY: windows::core::GUID = windows::core::GUID::from_u128(0x6b1e4f20_3c7a_4d59_9a2e_0f5c8d1b7e43);
+    let notice = Box::into_raw(Box::new(Gone {
+        methods: &GONE.0,
+        references: std::sync::atomic::AtomicU32::new(1),
+        kind,
+        bytes,
+    }));
+    // SAFETY: a COM object of ours with one reference, which this drops; the
+    // object takes its own.
+    unsafe {
+        let notice = windows::core::IUnknown::from_raw(notice.cast());
+        if object.SetPrivateDataInterface(&KEY, &notice).is_ok() {
+            BUFFER_BYTES[kind].fetch_add(bytes, Relaxed);
+            BUFFER_COUNT[kind].fetch_add(1, Relaxed);
+        } else {
+            // Not counted, so it must not be released as counted.
+            std::mem::forget(notice);
+        }
+    }
+}
+
+/// Diagnostics: one line with the card's use as the system counts it, beside
+/// the layer's own host-copy counters, so that a rise can be set against
+/// them. Only atomics are read: the card's use is asked from inside the
+/// texture pass, where no lock may be taken here.
+pub(crate) fn card_line(why: &str, budget: u64, usage: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mb = |v: u64| v >> 20;
+    let host_all = crate::resource::HOST_TEXTURES[1].load(Relaxed);
+    let fills = crate::resource::KINDS[1].load(Relaxed);
+    let [tex_made, tex_let_go, stg_made, stg_let_go] = crate::pool::block_counts();
+    let [up_live, sh_live] = [BUFFER_BYTES[0].load(Relaxed), BUFFER_BYTES[1].load(Relaxed)];
+    let [up_count, sh_count] = [BUFFER_COUNT[0].load(Relaxed), BUFFER_COUNT[1].load(Relaxed)];
+    tracing::info!(
+        frame = crate::frame::current(),
+        budget_mb = mb(budget),
+        in_use_mb = mb(usage),
+        host_copies_mb = mb(host_all),
+        title_fill_copies_mb = mb(fills),
+        other_host_copies_mb = mb(host_all.saturating_sub(fills)),
+        picked_heap_textures_mb = mb(crate::draw::HEAP_TEXTURE_BYTES.load(Relaxed)),
+        tiles_given_mb = mb(crate::tiles::given_total()),
+        texture_blocks_mb = mb(tex_made.saturating_sub(tex_let_go)),
+        texture_blocks_made_mb = mb(tex_made),
+        staging_blocks_mb = mb(stg_made.saturating_sub(stg_let_go)),
+        first_binds = crate::pipeline::FIRST_BINDS.load(Relaxed),
+        upload_buffers_live_mb = mb(up_live),
+        upload_buffers_live = up_count,
+        shared_buffers_live_mb = mb(sh_live),
+        shared_buffers_live = sh_count,
+        "card: {why}"
+    );
+}
+
+/// Diagnostics: [`card_line`] when the card's use has risen 512 MB since the
+/// last such line, and at most one a quarter second.
+pub(crate) fn card_growth(budget: u64, usage: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static LAST_USE: AtomicU64 = AtomicU64::new(0);
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    let last = LAST_USE.load(Relaxed);
+    if usage < last {
+        LAST_USE.store(usage, Relaxed);
+        return;
+    }
+    if usage < last.saturating_add(512 << 20) {
+        return;
+    }
+    let now = crate::host::now_ms();
+    if now < LAST_MS.load(Relaxed).saturating_add(250) {
+        return;
+    }
+    LAST_USE.store(usage, Relaxed);
+    LAST_MS.store(now, Relaxed);
+    card_line("in use rose", budget, usage);
+}
+
 /// Logs where the memory is: the process and the PC, then what this crate
 /// holds by kind (alive now), then the host buffers made since the start.
 fn log_memory() {
@@ -828,7 +976,8 @@ fn log_memory() {
         h.log_video_memory("with the memory line");
     }
     // What else holds memory: the map, on a thread of its own, with every
-    // sixth line; and what the shader table and the pipeline library keep.
+    // `VICTORY_MEMORY_MAP`th line (60 unless set: about every 5 minutes); and
+    // what the shader table and the pipeline library keep.
     static LINES: AtomicU64 = AtomicU64::new(0);
     static WALKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let every = memory_map();

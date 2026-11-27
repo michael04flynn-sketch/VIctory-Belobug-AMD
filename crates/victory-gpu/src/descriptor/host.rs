@@ -1569,6 +1569,10 @@ pub(crate) fn probe_view_limit() {
                         NodeMask: 0,
                     })
             };
+            // (What the host says to a size it refuses tells which limit this driver has.)
+            if let Err(e) = &made {
+                tracing::info!(count, error = %e, "the host refused a view heap of this many views");
+            }
             made.is_ok()
         };
         let twins = raw_twins() && fits(2 * RAW_TWINS);

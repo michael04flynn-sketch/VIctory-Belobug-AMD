@@ -206,11 +206,35 @@ struct Pool<B> {
     /// No new block is asked for before this time after one was refused
     /// ([`Pool::grow`]).
     retry_growth_at: u64,
+    /// Where blocks made and let go are counted, read by the card line
+    /// (`copystat`) without a lock; `None` for a pool nobody reads.
+    counts: Option<&'static Counts>,
 }
+
+/// Blocks made and let go since the start, for one pool.
+pub(crate) struct Counts {
+    made: AtomicU64,
+    let_go: AtomicU64,
+}
+
+impl Counts {
+    const fn new() -> Counts {
+        Counts { made: AtomicU64::new(0), let_go: AtomicU64::new(0) }
+    }
+}
+
+static TEXTURE_COUNTS: Counts = Counts::new();
+static STAGING_COUNTS: Counts = Counts::new();
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0, counts: None }
+    }
+
+    /// The same pool, counting its blocks in `counts`.
+    const fn counted(mut self, counts: &'static Counts) -> Pool<B> {
+        self.counts = Some(counts);
+        self
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -302,6 +326,9 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
+        if let Some(counts) = self.counts {
+            counts.made.fetch_add(1, Ordering::Relaxed);
+        }
         self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
         i
     }
@@ -338,6 +365,9 @@ impl<B: Clone> Pool<B> {
                 if block.as_ref().is_some_and(|b| b.free.whole(BLOCK)) {
                     spare += 1;
                     if spare > most {
+                        if let Some(counts) = self.counts {
+                            counts.let_go.fetch_add(1, Ordering::Relaxed);
+                        }
                         *block = None;
                     }
                 }
@@ -356,8 +386,21 @@ struct Upload(ID3D12Resource, *mut u8);
 // SAFETY: the mapping is written by the owners of its pieces, each its own.
 unsafe impl Send for Upload {}
 
-static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
-static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
+static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT).counted(&TEXTURE_COUNTS));
+static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT).counted(&STAGING_COUNTS));
+
+/// Bytes of the blocks made and let go since the start, as
+/// `[textures made, textures let go, staging made, staging let go]`: atomics
+/// only, for the card line (`copystat`).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn block_counts() -> [u64; 4] {
+    let bytes = |c: &Counts| {
+        [c.made.load(Ordering::Relaxed) * BLOCK, c.let_go.load(Ordering::Relaxed) * BLOCK]
+    };
+    let [tm, tl] = bytes(&TEXTURE_COUNTS);
+    let [sm, sl] = bytes(&STAGING_COUNTS);
+    [tm, tl, sm, sl]
+}
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
