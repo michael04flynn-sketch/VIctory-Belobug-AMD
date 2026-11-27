@@ -36,6 +36,13 @@ param(
     # the first world frame then needed about 13 GB more than the title's start. Textures
     # beyond the cap arrive later or not at all; raise it if they stay blurry.
     [int]$TextureCapMB = 1024,
+    # Device-removed data (VICTORY_D3D12_DRED, as scripts\play.ps1 sets it): light keeps what a
+    # lost device was doing, so the log names the command and pipeline instead of "no
+    # breadcrumbs". off leaves it out.
+    [ValidateSet('off', 'light', 'faults')][string]$Dred = 'light',
+    # The D3D12 debug layer (VICTORY_D3D12_DEBUG=1): a refused command is named. Slower; needs
+    # Windows' "Graphics Tools" feature, and is ignored without it.
+    [switch]$D3dDebug,
     # Where the log goes (default: logs\ in the repository). -NoLog writes none.
     [string]$LogDir,
     [switch]$NoLog
@@ -81,6 +88,8 @@ $lowMemory = @{
 # and that growth filled the card's budget. The cap rises to 3072 MB so the windows fit. Not
 # measured on this GPU yet: the line "title memory in place" (every 10 s) says what was placed and
 # what was turned down.
+if ($Dred -ne 'off') { $lowMemory['VICTORY_D3D12_DRED'] = $Dred }
+if ($D3dDebug) { $lowMemory['VICTORY_D3D12_DEBUG'] = '1' }
 if ($Probe) { $lowMemory['VICTORY_INPLACE_PROBE'] = '1' }
 if ($TextureCapMB -gt 0) { $lowMemory['VICTORY_TEXTURE_BUDGET_MB'] = [string]$TextureCapMB }
 if ($InPlace) {
@@ -212,6 +221,17 @@ $meaning = switch ($exitCode) {
 }
 $summary = "Exit code $exitCode $(if ($meaning) { "($meaning) " })after {0:N0} s." -f $clock.Elapsed.TotalSeconds
 Write-Host $summary
+# What the run said about why the device went (the exit code only says that it did).
+if ($logPath -and (Test-Path $logPath)) {
+    $text = Get-Content $logPath -Raw
+    if ($text -match '0x887A0006') {
+        Write-Host 'The log says the GPU HUNG (0x887A0006): Windows reset it after about 2 s on one piece of work (TdrDelay). Read the lines after "host GPU device removed" for the command; or give slow frames room (elevated PowerShell, then restart):'
+        Write-Host '  reg add HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers /v TdrDelay /t REG_DWORD /d 30 /f'
+        Write-Host '  (undo: reg delete HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers /v TdrDelay /f)'
+    } elseif ($text -match '0x8007000E') {
+        Write-Host 'The log says the card ran out of memory (0x8007000E): see the .mem.csv for the free RAM at that moment.'
+    }
+}
 $after = Show-MemoryState 'after the run'
 if ($writer) {
     $writer.WriteLine('# ----')
