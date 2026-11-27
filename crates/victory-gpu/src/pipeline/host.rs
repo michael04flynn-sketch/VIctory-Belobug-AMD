@@ -1244,6 +1244,12 @@ mod tests {
             eprintln!("no host depth bounds support; skipped");
             return;
         }
+        // A software adapter (WARP, the Basic Render Driver: what a hosted runner has) reports the
+        // feature and does not filter by it: the draw below would pass where it must be rejected.
+        if host.is_software() {
+            eprintln!("software adapter; skipped");
+            return;
+        }
         let Some(dxc) = dxc() else {
             eprintln!("no PC dxc.exe; skipped");
             return;

@@ -49,6 +49,24 @@ param(
     # indirect mesh draw. A refused shader's draws are dropped (geometry missing, no hang).
     # -NoMeshStrict turns it off.
     [switch]$NoMeshStrict,
+    # CPU side (the log of 2026-11-27: the card was about 25 % busy and the frame waited on the
+    # submitting thread; 2.6 GB a frame of title buffer copies were compared on the CPU).
+    # VICTORY_FAST_WIDE=1: the helper threads use the 12 cores that share the performance cores'
+    # cache (4 P + 8 E on a Core Ultra X9 388H) instead of the 4 fast ones; the submitting thread
+    # stays on the fast cores. Not measured on a title; -NoFastWide turns it off.
+    [switch]$NoFastWide,
+    # MB of title buffer copies kept in the card's memory, where the card compares them instead of
+    # the CPU (VICTORY_CARD_BUFFERS_MB). It was 128 (a memory saving); 512 is the layer's own value
+    # for budgets up to 12 GiB. Each MB is system memory on this GPU, written buffers twice.
+    [int]$CardBuffersMB = 512,
+    # Which way to trade CPU time against memory (each sets -CardBuffersMB and -TextureCapMB unless
+    # you pass them): Lean 128 / 768 (least memory, most CPU compare work, fewest texture copies),
+    # Balanced 512 / 1024 (the default), Fast 1024 / 1536 (the most card buffers, the most memory).
+    # A card copy of a title buffer costs a CPU-side copy and a card-side copy (and a third, "before",
+    # for one shaders write): on this GPU all of it is system memory. Measured: the 1024 cap took
+    # title-filled texture copies from 2,451 MB to 1,039 MB. The buffer-memory figures are from the
+    # code's own description, not measured here.
+    [ValidateSet('Lean', 'Balanced', 'Fast')][string]$Profile = 'Balanced',
     # Shader hashes (16 hex digits, comma separated; diag build) whose draws are skipped
     # (VICTORY_SKIP_PIPELINES): to test whether one pipeline is the one that hangs the device.
     [string]$SkipPipelines,
@@ -56,6 +74,16 @@ param(
     [string]$LogDir,
     [switch]$NoLog
 )
+
+$profiles = @{
+    Lean     = @{ CardBuffersMB = 128;  TextureCapMB = 768 }
+    Balanced = @{ CardBuffersMB = 512;  TextureCapMB = 1024 }
+    Fast     = @{ CardBuffersMB = 1024; TextureCapMB = 1536 }
+}
+foreach ($name in 'CardBuffersMB', 'TextureCapMB') {
+    if (-not $PSBoundParameters.ContainsKey($name)) { Set-Variable -Name $name -Value $profiles[$Profile][$name] }
+}
+Write-Host "Profile $Profile`: card buffers $CardBuffersMB MB, title-filled texture copies capped at $TextureCapMB MB."
 
 # Memory knobs (values in MB unless the name says KB). Each one lowers how much is kept
 # ready at once, at the cost of textures arriving a little later.
@@ -67,9 +95,9 @@ $lowMemory = @{
     # queue closed.
     # Only works while VICTORY_TEXTURE_BUDGET_MB is unset: that setting skips the budget check.
     VICTORY_TEXTURE_ROOM_PERCENT      = '50'
-    # Title buffers copied into card memory: at most 128 MB, and only buffers of at least 1 MB.
+    # Title buffers copied into card memory: at most -CardBuffersMB, and only buffers of at least 1 MB.
     # The queue also keeps less card room back for these copies.
-    VICTORY_CARD_BUFFERS_MB           = '128'
+    VICTORY_CARD_BUFFERS_MB           = [string]$CardBuffersMB
     VICTORY_CARD_BUFFERS_MIN_KB       = '1024'
     # Card memory kept free for render targets: left at the layer's default (3,072 MB). A lower
     # value lets textures fill more of the card.
@@ -97,6 +125,7 @@ $lowMemory = @{
 # and that growth filled the card's budget. The cap rises to 3072 MB so the windows fit. Not
 # measured on this GPU yet: the line "title memory in place" (every 10 s) says what was placed and
 # what was turned down.
+if (-not $NoFastWide) { $lowMemory['VICTORY_FAST_WIDE'] = '1' }
 if (-not $NoMeshStrict) { $lowMemory['VICTORY_MESH_OUTPUT_STRICT'] = '1' }
 if ($SkipPipelines) { $lowMemory['VICTORY_SKIP_PIPELINES'] = $SkipPipelines }
 if ($Dred -ne 'off') { $lowMemory['VICTORY_D3D12_DRED'] = $Dred }
@@ -240,6 +269,24 @@ $meaning = switch ($exitCode) {
 }
 $summary = "Exit code $exitCode $(if ($meaning) { "($meaning) " })after {0:N0} s." -f $clock.Elapsed.TotalSeconds
 Write-Host $summary
+# Where a frame's time went, from the last statistics the run printed: how busy the card was and
+# how much title-buffer memory the CPU compared (the figures to set against a run with other settings).
+if ($logPath -and (Test-Path $logPath)) {
+    $t = Get-Content $logPath -Raw
+    $busy = [regex]::Matches($t, 'nothing of ours queued ([\d.]+) ms \(the card about (\d+)% busy')
+    $cmp = [regex]::Matches($t, '([\d.]+) MB in \d+ ranges of title buffers. copies')
+    if ($busy.Count) { Write-Host "Last frame statistics: card about $($busy[$busy.Count - 1].Groups[2].Value) % busy, idle $($busy[$busy.Count - 1].Groups[1].Value) ms a frame." }
+    if ($cmp.Count) { Write-Host "  title buffer copies compared on the CPU: $($cmp[$cmp.Count - 1].Groups[1].Value) MB a frame (more of them on the card with -CardBuffersMB)." }
+}
+# The memory timeline's extremes (the RAM figures to set against another profile).
+if ($memPath -and (Test-Path $memPath)) {
+    $rows = @(Import-Csv $memPath)
+    if ($rows.Count) {
+        $minFree = ($rows | ForEach-Object { [int]$_.free_ram_mb } | Measure-Object -Minimum).Minimum
+        $peakWs = ($rows | Where-Object { $_.victory_ws_mb } | ForEach-Object { [int]$_.victory_ws_mb } | Measure-Object -Maximum).Maximum
+        Write-Host ("Memory: lowest free RAM {0:N1} GB, peak victory.exe working set {1:N1} GB." -f ($minFree / 1024), ($peakWs / 1024))
+    }
+}
 # What the run said about why the device went (the exit code only says that it did).
 if ($logPath -and (Test-Path $logPath)) {
     $text = Get-Content $logPath -Raw
