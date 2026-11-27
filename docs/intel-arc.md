@@ -156,6 +156,29 @@ Experiments, both in the launcher: `-MeshStrict` is on by default (`-NoMeshStric
 85eaffa59a3a6ecf` skips that shader's draws (diag build) to test whether it is the one. After a hang
 the launcher prints the first unfinished command and its pipeline from the log.
 
+## CPU and GPU load (from the seventh run's frame statistics)
+
+Last statistics block before the hang (frames of roughly 0.3 s, so about 3 fps):
+
+- The card was about 25 % busy: 241.7 ms a frame with nothing of ours queued, 163.1 ms of it while
+  the submitting thread was still preparing (the card idle behind it).
+- The submitting thread spent 113 ms in the lists' steps and 90.7 ms waiting for flights; texture
+  refreshes took 174.5 ms across threads, 148.9 ms of it waiting for the runtime to stop remapping
+  title memory.
+- 2,601 MB a frame of title buffer copies were compared on the CPU (2,579 MB snapshotted), 2,567
+  MB of them in copies of 1 MiB or more. The log says `VICTORY_CARD_BUFFERS_MIN_MB=1` would have the
+  card look there; the real limiter is the cap the launcher set, 128 MB (`VICTORY_CARD_BUFFERS_MB`).
+- The process kept its threads on 4 fast cores of 16 (`our threads' processors`); the code has an
+  opt-in for exactly this part (`VICTORY_FAST_WIDE=1`: four performance cores, eight efficiency
+  cores on one cache, "not measured on a title yet").
+
+So the frame is CPU-bound and the card idles. Changes, in the launcher and not measured: 
+`VICTORY_FAST_WIDE=1` by default (`-NoFastWide`) and `-CardBuffersMB` 512 instead of 128. More
+buffers on the card means more system memory used (written buffers count twice), so watch
+`.mem.csv`. After a run the launcher prints the last card-busy figure and the MB compared on
+the CPU; those are the two numbers to compare between settings. None of this can matter until a
+run gets past the hang at the mesh draw above.
+
 ## Not known yet
 
 - Whether the process itself or other programs took the RAM (the `.mem.csv` of the next run).
