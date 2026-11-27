@@ -1090,6 +1090,22 @@ fn create() -> windows::core::Result<Host> {
                 "host D3D12 adapter"
             );
         }
+        // Whether the GPU shares the PC's memory (an iGPU such as Intel's): then the card's own
+        // memory figure above (`DedicatedVideoMemory`) is only a small carve-out and the budgets
+        // the system reports are what counts. Said in the log so a run on such a host is
+        // recognisable; nothing is decided from it here.
+        let mut arch = D3D12_FEATURE_DATA_ARCHITECTURE1::default();
+        if device
+            .CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE1, (&raw mut arch).cast(), size_of_val(&arch) as u32)
+            .is_ok()
+        {
+            tracing::info!(
+                uma = arch.UMA.as_bool(),
+                cache_coherent_uma = arch.CacheCoherentUMA.as_bool(),
+                isolated_mmu = arch.IsolatedMMU.as_bool(),
+                "host memory architecture"
+            );
+        }
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,

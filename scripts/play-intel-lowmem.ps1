@@ -18,6 +18,8 @@ param(
     # Free RAM (GB) below which the run is not started (-Force: start anyway).
     [double]$MinFreeGB = 14,
     [switch]$Force,
+    # Free commit (RAM + pagefile, GB) below which the run is not started.
+    [double]$MinCommitGB = 20,
     # Use title memory in place instead of copying it (VICTORY_INPLACE=1, see below).
     [switch]$InPlace,
     # Where the log goes (default: logs\ in the repository). -NoLog writes none.
@@ -76,7 +78,18 @@ foreach ($k in $lowMemory.Keys) { $merged[$k] = $lowMemory[$k] }
 foreach ($k in $More.Keys) { $merged[$k] = $More[$k] }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
-if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; exit 1 }
+if (-not (Test-Path $victory)) {
+    # Fall back to the other build when only that one exists (only diag is built by default here).
+    $other = if ($Build -eq 'release') { 'diag' } else { 'release' }
+    $alt = Join-Path $PSScriptRoot "..\target\$other\victory.exe"
+    if (Test-Path $alt) {
+        Write-Host "No $victory; using the $other build instead."
+        $Build = $other
+        $victory = $alt
+    } else {
+        Write-Host "No $victory. Build it first (README.md)."; exit 1
+    }
+}
 if (-not (Test-Path $Exe)) { Write-Host "No $Exe."; exit 1 }
 $Exe = (Resolve-Path $Exe).Path
 
@@ -95,6 +108,15 @@ function Show-MemoryState([string]$when) {
     $free
 }
 $freeNow = Show-MemoryState 'before the run'
+# Commit headroom: on an iGPU the card's memory is system memory too, and the title's first
+# world frame grows the process by several GB. Free RAM alone does not show whether the
+# pagefile can take it when RAM runs out.
+$osNow = Get-CimInstance Win32_OperatingSystem
+$commitFree = [math]::Round($osNow.FreeVirtualMemory / 1MB, 1)
+if ($commitFree -lt $MinCommitGB -and -not $Force) {
+    Write-Host "Only $commitFree GB of commit left (limit $MinCommitGB GB, -MinCommitGB). Grow the pagefile (System Managed or 16 GB or more), or pass -Force."
+    exit 2
+}
 if ($freeNow -lt $MinFreeGB -and -not $Force) {
     Write-Host "Only $freeNow GB free, under the $MinFreeGB GB limit (-MinFreeGB). Close the biggest programs above (or restart explorer.exe if it is one), or pass -Force to start anyway."
     exit 2
