@@ -198,6 +198,37 @@ it prints the lowest free RAM and peak working set next to the card-busy and CPU
 two profiles can be compared on the same four numbers. Which profile is better on this machine is
 not known: no run has lived long enough to measure frame time.
 
+## Eighth run (2026-11-27, Balanced profile, mesh-output strict on, `TdrDelay` 10)
+
+Ended at 65 s, hung device again, at the same draw: list 572, 48 of 88 commands done, first
+unfinished command 48 = `[mesh 85eaffa59a3a6ecf, pixel b352dd911b665364]` (third run in a row).
+
+- The wait before the reset scaled with `TdrDelay`: the submitting thread was 11.9 s into its list
+  with the value at 10, against 3.3 s at the default 2 (the seventh run's 3.2 s with 30 in the
+  registry was too short for the value to have been in force). So the draw does not finish at all:
+  a real hang, not a slow frame.
+- `VICTORY_MESH_OUTPUT_STRICT=1` changed nothing: no mesh shader was refused and the same draw ran.
+  The shader is not an output-size overshoot.
+- Same list, in flight around it: `3c067b199b10fea2`, `53a2a19cf91c6088`, `8321022826281144`.
+
+What the profile did (this run against the seventh, last statistics block of each):
+
+| | Seventh (128 MB card buffers, no wide helpers) | Eighth (512 MB, `VICTORY_FAST_WIDE=1`) |
+|---|---|---|
+| Card busy | 22 to 25 % | 48 to 67 % |
+| Title buffers compared on the CPU | about 2,500 to 2,600 MB a frame | about 140 to 170 MB a frame |
+| Threads | 4 fast cores | 4 fast, 12 wide, of 16 |
+| Lowest free RAM / peak working set | 6.2 / 18.0 GB | 5.7 / 18.9 GB |
+
+So the CPU side moved as intended and the cost was about 0.9 GB more working set. Frame time was
+not measured (the log does not carry it; the panel does).
+
+Launcher: `-MeshTest` passes the project's own search for what stops the card
+(`VICTORY_MESH_TEST`, `draw.rs`): `scissor` runs the mesh shaders but rasterises one pixel (a hang
+that stays is the mesh shader itself, one that goes is what its triangles cover), `skip` issues
+no mesh draw, `keep:<digit>` keeps only shaders whose hash ends in that digit. After a hang the
+launcher prints the three next steps for the named command.
+
 ## Not known yet
 
 - Whether the process itself or other programs took the RAM (the `.mem.csv` of the next run).

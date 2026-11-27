@@ -70,6 +70,11 @@ param(
     # Shader hashes (16 hex digits, comma separated; diag build) whose draws are skipped
     # (VICTORY_SKIP_PIPELINES): to test whether one pipeline is the one that hangs the device.
     [string]$SkipPipelines,
+    # The project's own search for what stops the card (VICTORY_MESH_TEST, diag build): scissor runs
+    # every mesh draw's shaders but rasterises one pixel (a hang that stays is the mesh shader itself,
+    # one that goes is what its triangles cover); skip issues no mesh draw at all; keep:<digit> keeps
+    # only the mesh draws whose shader hash ends in that digit.
+    [string]$MeshTest,
     # Where the log goes (default: logs\ in the repository). -NoLog writes none.
     [string]$LogDir,
     [switch]$NoLog
@@ -127,6 +132,7 @@ $lowMemory = @{
 # what was turned down.
 if (-not $NoFastWide) { $lowMemory['VICTORY_FAST_WIDE'] = '1' }
 if (-not $NoMeshStrict) { $lowMemory['VICTORY_MESH_OUTPUT_STRICT'] = '1' }
+if ($MeshTest) { $lowMemory['VICTORY_MESH_TEST'] = $MeshTest }
 if ($SkipPipelines) { $lowMemory['VICTORY_SKIP_PIPELINES'] = $SkipPipelines }
 if ($Dred -ne 'off') { $lowMemory['VICTORY_D3D12_DRED'] = $Dred }
 if ($D3dDebug) { $lowMemory['VICTORY_D3D12_DEBUG'] = '1' }
@@ -302,11 +308,16 @@ if ($logPath -and (Test-Path $logPath)) {
             }
             if ($null -ne $stuck -and $tail -match "command $stuck ran (\[[^\]]+\])") {
                 Write-Host "Device-removed data: the first unfinished command is $stuck, running $($Matches[1])."
+                $mesh = [regex]::Match($Matches[1], 'mesh ([0-9a-f]{16})').Groups[1].Value
+                Write-Host 'Same command in several runs means a fault in that draw. To narrow it, rerun with one of:'
+                Write-Host '  -MeshTest scissor   (still hangs: the mesh shader itself; no hang: what its triangles cover)'
+                if ($mesh) { Write-Host "  -SkipPipelines $mesh   (that shader's draws are dropped: some geometry missing)" }
+                Write-Host '  -MeshTest skip      (no mesh draws at all)'
             } elseif ($tail -match 'command (\d+) ran (\[[^\]]+\])') {
                 Write-Host "Device-removed data: near command $($Matches[1]), running $($Matches[2])."
             }
         }
-        Write-Host 'The log says the GPU HUNG (0x887A0006): Windows reset it after about 2 s on one piece of work (TdrDelay). Read the lines after "host GPU device removed" for the command; or give slow frames room (elevated PowerShell, then restart):'
+        Write-Host 'The log says the GPU HUNG (0x887A0006): Windows reset it after TdrDelay seconds on one piece of work. If the time to the reset grows when TdrDelay does (11.9 s at 10 in the run of 2026-11-27, 3.3 s at 2), the draw never finishes: a real hang, not a slow frame. Read the lines after "host GPU device removed" for the command; or give slow frames room (elevated PowerShell, then restart):'
         Write-Host '  reg add HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers /v TdrDelay /t REG_DWORD /d 30 /f'
         Write-Host '  (undo: reg delete HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers /v TdrDelay /f)'
     } elseif ($text -match '0x8007000E') {
