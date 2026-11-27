@@ -6,6 +6,8 @@
 # -Build        release (the default, faster) or diag
 # -InPlace      use title memory in place instead of copying it (VICTORY_INPLACE=1)
 # -MinFreeGB    free RAM below which the run is not started (default 14); -Force starts anyway
+# -LogDir / -NoLog   the run is logged to logs\victory-<time>.log (newest 20 kept) with a header
+#               (command, git commit, GPU and driver, env values) and an exit-code summary
 # Extra settings may be passed the same way as play.ps1: -More @{VICTORY_PANEL='1'}
 # Measurements of this profile on Intel hardware: none yet. Check the frame time with
 # VICTORY_PANEL=1 and VRAM in Task Manager before relying on it.
@@ -17,7 +19,10 @@ param(
     [double]$MinFreeGB = 14,
     [switch]$Force,
     # Use title memory in place instead of copying it (VICTORY_INPLACE=1, see below).
-    [switch]$InPlace
+    [switch]$InPlace,
+    # Where the log goes (default: logs\ in the repository). -NoLog writes none.
+    [string]$LogDir,
+    [switch]$NoLog
 )
 
 # Memory knobs (values in MB unless the name says KB). Each one lowers how much is kept
@@ -106,8 +111,67 @@ if ($discarded) {
 }
 foreach ($k in $merged.Keys) { Set-Item "Env:$k" $merged[$k] }
 # The same launch scripts\play.ps1 makes, with the console chosen here (play.ps1 cannot choose it).
-Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
-try { & $victory run $Exe --execute --console series-s } finally { Pop-Location }
+$repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$victoryArgs = @('run', $Exe, '--execute', '--console', 'series-s')
+
+# Log file: everything victory.exe prints (stdout and stderr) goes to the console and to a
+# file, with a header saying exactly what was run. -NoLog turns it off.
+$writer = $null
+$logPath = $null
+if (-not $NoLog) {
+    if (-not $LogDir) { $LogDir = Join-Path $repo 'logs' }
+    New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+    $logPath = Join-Path $LogDir ("victory-{0:yyyyMMdd-HHmmss}.log" -f (Get-Date))
+    $writer = New-Object System.IO.StreamWriter($logPath, $false, (New-Object System.Text.UTF8Encoding($false)))
+    $writer.AutoFlush = $true   # a crash or a kill still leaves the lines printed so far
+    $commit = (& git -C $repo rev-parse --short HEAD 2>$null)
+    $gpu = (Get-CimInstance Win32_VideoController | ForEach-Object { "$($_.Name) (driver $($_.DriverVersion))" }) -join '; '
+    $writer.WriteLine("# started   $(Get-Date -Format o)")
+    $writer.WriteLine("# command   $victory $($victoryArgs -join ' ')")
+    $writer.WriteLine("# build     $Build, git $commit")
+    $writer.WriteLine("# host      $gpu")
+    $writer.WriteLine("# inplace   $InPlace, free RAM before: $freeNow GB")
+    foreach ($k in ($merged.Keys | Sort-Object)) { $writer.WriteLine("# env       $k=$($merged[$k])") }
+    $writer.WriteLine('# ----')
+    Write-Host "Log: $logPath"
+}
+
+$clock = [Diagnostics.Stopwatch]::StartNew()
+Push-Location $repo   # victory.toml is looked for here
+try {
+    # 2>&1 merges stderr; each item is turned into a plain string so PowerShell 5.1 does not
+    # print stderr lines as error records.
+    & $victory @victoryArgs 2>&1 | ForEach-Object {
+        $line = if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { "$_" }
+        Write-Host $line
+        if ($writer) { $writer.WriteLine($line) }
+    }
+} finally {
+    Pop-Location
+}
 $exitCode = $LASTEXITCODE
-[void](Show-MemoryState 'after the run')
+$clock.Stop()
+
+# Exit code 0 is a clean exit. A large unsigned code is a Windows crash status.
+$meaning = switch ($exitCode) {
+    0 { 'clean exit' }
+    -1073741819 { 'access violation (0xC0000005)' }
+    -1073740791 { 'stack buffer overrun (0xC0000409)' }
+    -1073741571 { 'stack overflow (0xC00000FD)' }
+    -1073740940 { 'heap corruption (0xC0000374)' }
+    default { '' }
+}
+$summary = "Exit code $exitCode $(if ($meaning) { "($meaning) " })after {0:N0} s." -f $clock.Elapsed.TotalSeconds
+Write-Host $summary
+$after = Show-MemoryState 'after the run'
+if ($writer) {
+    $writer.WriteLine('# ----')
+    $writer.WriteLine("# $summary")
+    $writer.WriteLine("# free RAM after: $after GB")
+    $writer.Close()
+    # Keep the newest 20 logs.
+    Get-ChildItem $LogDir -Filter 'victory-*.log' | Sort-Object LastWriteTime -Descending |
+        Select-Object -Skip 20 | Remove-Item -ErrorAction SilentlyContinue
+    Write-Host "Log saved: $logPath"
+}
 exit $exitCode
