@@ -43,6 +43,15 @@ param(
     # The D3D12 debug layer (VICTORY_D3D12_DEBUG=1): a refused command is named. Slower; needs
     # Windows' "Graphics Tools" feature, and is ignored without it.
     [switch]$D3dDebug,
+    # Mesh shaders whose outputs pass the host's 32 KiB even at their lane count are refused
+    # instead of being emitted anyway (VICTORY_MESH_OUTPUT_STRICT=1; lower.rs says "refuse them
+    # here if one hangs"). On by default here: both runs with device-removed data hung in the same
+    # indirect mesh draw. A refused shader's draws are dropped (geometry missing, no hang).
+    # -NoMeshStrict turns it off.
+    [switch]$NoMeshStrict,
+    # Shader hashes (16 hex digits, comma separated; diag build) whose draws are skipped
+    # (VICTORY_SKIP_PIPELINES): to test whether one pipeline is the one that hangs the device.
+    [string]$SkipPipelines,
     # Where the log goes (default: logs\ in the repository). -NoLog writes none.
     [string]$LogDir,
     [switch]$NoLog
@@ -88,6 +97,8 @@ $lowMemory = @{
 # and that growth filled the card's budget. The cap rises to 3072 MB so the windows fit. Not
 # measured on this GPU yet: the line "title memory in place" (every 10 s) says what was placed and
 # what was turned down.
+if (-not $NoMeshStrict) { $lowMemory['VICTORY_MESH_OUTPUT_STRICT'] = '1' }
+if ($SkipPipelines) { $lowMemory['VICTORY_SKIP_PIPELINES'] = $SkipPipelines }
 if ($Dred -ne 'off') { $lowMemory['VICTORY_D3D12_DRED'] = $Dred }
 if ($D3dDebug) { $lowMemory['VICTORY_D3D12_DEBUG'] = '1' }
 if ($Probe) { $lowMemory['VICTORY_INPLACE_PROBE'] = '1' }
@@ -233,10 +244,20 @@ Write-Host $summary
 if ($logPath -and (Test-Path $logPath)) {
     $text = Get-Content $logPath -Raw
     if ($text -match '0x887A0006') {
-        # The first command the device-removed data names as running (a list of commands that did not finish).
+        # The command the device-removed data says did not finish: the first list whose breadcrumbs
+        # show fewer commands done than recorded ("done/count"), and its command number "done".
         $after = $text.IndexOf('device-removed data')
-        if ($after -ge 0 -and $text.Substring($after) -match 'command (\d+) ran (\[[^\]]+\])') {
-            Write-Host "Device-removed data: the hung list was at about command $($Matches[1]) (the first the data names), running $($Matches[2])."
+        if ($after -ge 0) {
+            $tail = $text.Substring($after)
+            $stuck = $null
+            foreach ($m in [regex]::Matches($tail, '"(\d+)/(\d+) [^"]*"')) {
+                if ([int]$m.Groups[1].Value -lt [int]$m.Groups[2].Value) { $stuck = [int]$m.Groups[1].Value; break }
+            }
+            if ($null -ne $stuck -and $tail -match "command $stuck ran (\[[^\]]+\])") {
+                Write-Host "Device-removed data: the first unfinished command is $stuck, running $($Matches[1])."
+            } elseif ($tail -match 'command (\d+) ran (\[[^\]]+\])') {
+                Write-Host "Device-removed data: near command $($Matches[1]), running $($Matches[2])."
+            }
         }
         Write-Host 'The log says the GPU HUNG (0x887A0006): Windows reset it after about 2 s on one piece of work (TdrDelay). Read the lines after "host GPU device removed" for the command; or give slow frames room (elevated PowerShell, then restart):'
         Write-Host '  reg add HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers /v TdrDelay /t REG_DWORD /d 30 /f'
