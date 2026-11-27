@@ -93,6 +93,23 @@ Changes for it, in the launcher: `-TextureCapMB` (default 1024, sets `VICTORY_TE
 and `-MinFreeGB` 23. Not measured. With 31 GB of RAM this machine is at the edge: the title needs
 about 20 GB of working set by the first world frame.
 
+## Fifth run (2026-11-27, texture cap 1024 MB, 25.9 GB free before)
+
+Reached frame ~1000 (53 s) and ended again, but this time not for memory: working set 18.3 GB,
+free RAM never under 6.9 GB, no E_OUTOFMEMORY. The device was removed as HUNG (0x887A0006, then
+0x887A0005) after the submitting thread spent 3.3 s preparing one submission, with 13 submissions
+sent ahead. Windows' default timeout (`TdrDelay` 2 s, default here) resets a GPU that works that
+long on one piece of work; whether the world's first frame is that slow on this iGPU is not
+established. The log said "no breadcrumbs" because the Intel launcher did not set
+`VICTORY_D3D12_DRED` (scripts\play.ps1 does).
+
+Changes: the launcher sets `VICTORY_D3D12_DRED=light` by default (`-Dred off|light|faults`), has
+`-D3dDebug`, and after a run reads its log: on 0x887A0006 it prints the `TdrDelay` registry
+command (to run elevated by hand; the launcher changes no system setting) and on 0x8007000E it
+points at the memory timeline. Pipeline-library notes: 40 of 61,293 pages of the 251 MB library
+read as zeros and some pipelines were remade ("The parameter is incorrect", 0x80070057); not
+shown to matter.
+
 ## Not known yet
 
 - Whether the process itself or other programs took the RAM (the `.mem.csv` of the next run).
