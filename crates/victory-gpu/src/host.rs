@@ -143,6 +143,13 @@ pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
     (now >> 32).saturating_sub(moment >> 32) >= frames && tenths * 100 >= ms
 }
 
+/// The card's budget on a GPU that shares the PC's memory: the system's, or less when the free RAM
+/// (`free`, less `reserve`) would not hold what could still be taken up to it; `usage` is what this
+/// process has on the card now. Without a reading of the free RAM, the system's.
+fn uma_budget(system: u64, usage: u64, free: Option<u64>, reserve: u64) -> u64 {
+    free.map_or(system, |free| system.min(usage.saturating_add(free.saturating_sub(reserve))))
+}
+
 /// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`.
 pub(crate) fn available_physical_ram() -> Option<u64> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -1171,6 +1178,21 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// On a shared-memory GPU the budget is cut to what is in use plus the free RAM less a reserve.
+    #[test]
+    fn the_budget_of_a_shared_memory_gpu_follows_the_free_ram() {
+        const GB: u64 = 1 << 30;
+        // Plenty of RAM free: the system's budget stands (the start of a run).
+        assert_eq!(super::uma_budget(15 * GB, GB, Some(25 * GB), 3 * GB), 15 * GB);
+        // 8.5 GB in use and 6 GB free: 8.5 + (6 - 3) = 11.5 GB, under the system's 15.
+        assert_eq!(super::uma_budget(15 * GB, 8 * GB + GB / 2, Some(6 * GB), 3 * GB), 11 * GB + GB / 2);
+        // Free RAM under the reserve: no more than is in use.
+        assert_eq!(super::uma_budget(15 * GB, 9 * GB, Some(2 * GB), 3 * GB), 9 * GB);
+        // The system's budget is never exceeded, and without a reading it stands.
+        assert_eq!(super::uma_budget(8 * GB, 8 * GB, Some(20 * GB), 3 * GB), 8 * GB);
+        assert_eq!(super::uma_budget(9 * GB, GB, None, 3 * GB), 9 * GB);
+    }
+
     /// A list of ours is found by its name, with the debug layer's note or not.
     #[cfg(feature = "diagnostics")]
     #[test]
@@ -10099,7 +10121,42 @@ impl Host {
         }
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::copystat::card_growth(own.Budget, own.CurrentUsage);
-        Some([own.Budget, own.CurrentUsage, shared.Budget, shared.CurrentUsage])
+        let budget = self.effective_budget(own.Budget, own.CurrentUsage);
+        Some([budget, own.CurrentUsage, shared.Budget, shared.CurrentUsage])
+    }
+
+    /// The card's budget as the texture queue and the sweep that lets textures go should see it.
+    /// On a GPU that shares the PC's memory the system's budget follows free RAM and says nothing
+    /// about what is left to take: it was 14,978 MB in a run that ended with 1.2 GB of RAM free
+    /// ([`uma_budget`]). There it is cut to what this process uses now plus the free RAM less a
+    /// reserve (`VICTORY_UMA_RESERVE_MB`, 3,072), so that copies of textures stop being made, and
+    /// idle ones are let go, before the PC runs out. `VICTORY_UMA_HEADROOM=0` keeps the system's.
+    fn effective_budget(&self, system: u64, usage: u64) -> u64 {
+        static ON: OnceLock<bool> = OnceLock::new();
+        static RESERVE: OnceLock<u64> = OnceLock::new();
+        if !crate::residency::uma() || !*ON.get_or_init(|| std::env::var_os("VICTORY_UMA_HEADROOM").is_none_or(|v| v != "0")) {
+            return system;
+        }
+        let reserve = *RESERVE.get_or_init(|| {
+            std::env::var("VICTORY_UMA_RESERVE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(3072) << 20
+        });
+        let free = available_physical_ram();
+        let budget = uma_budget(system, usage, free, reserve);
+        // Said now and then while it differs: the run's log shows what the queue worked with.
+        static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = now_ms();
+        if budget < system && now >= SAID.load(Ordering::Relaxed) {
+            SAID.store(now + 10_000, Ordering::Relaxed);
+            tracing::info!(
+                "shared-memory GPU: the card's budget is taken as {} MB, not the system's {} MB (in use {} MB, free RAM {} MB, reserve {} MB)",
+                budget >> 20,
+                system >> 20,
+                usage >> 20,
+                free.unwrap_or(0) >> 20,
+                reserve >> 20
+            );
+        }
+        budget
     }
 
     /// Both of the system's memory groups for this process, in bytes: for

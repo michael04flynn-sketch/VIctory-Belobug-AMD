@@ -30,12 +30,24 @@ param(
     [switch]$InPlace,
     # Also log what kind of title memory blocks -InPlace (VICTORY_INPLACE_PROBE=1: a census 30 s and 150 s in).
     [switch]$Probe,
-    # Cap (MB) on the host copies of textures the title fills (VICTORY_TEXTURE_BUDGET_MB; 0 = no
-    # cap, the layer's own rule). On a shared-memory GPU the layer's rule goes by the system's
-    # budget, which was 14,978 MB in the last run: it let 2,451 MB of such copies be made and
-    # the first world frame then needed about 13 GB more than the title's start. Textures
-    # beyond the cap arrive later or not at all; raise it if they stay blurry.
-    [int]$TextureCapMB = 1024,
+    # Hard cap (MB) on the host copies of textures the title fills (VICTORY_TEXTURE_BUDGET_MB;
+    # 0 = none: the layer goes by the card's budget, which on this GPU the host now cuts to what
+    # the free RAM can hold, VICTORY_UMA_HEADROOM). A hard cap is a hard stop: the run of
+    # 2026-11-27 01:08 with 1024 made 1,088 MB of copies, then 599 passes found no room and 2,930
+    # textures (5.6 GB) never got a copy: missing textures, nothing let go to make room.
+    [int]$TextureCapMB = 0,
+    # Share of the card's budget up to which texture copies are made (VICTORY_TEXTURE_ROOM_PERCENT,
+    # 50 to 97, layer default 90). Set by -Profile unless passed.
+    [int]$RoomPercent = 85,
+    # Free RAM (MB) the host keeps back when it works out the card's budget on this GPU
+    # (VICTORY_UMA_RESERVE_MB). Set by -Profile unless passed.
+    [int]$ReserveMB = 3072,
+    # Wait for the runtime to finish remapping title memory before reading a texture (the layer's
+    # default; slow while the world streams in: 13.5 s a frame of waiting summed over threads in
+    # the run above). Without this switch textures are read through the kernel instead
+    # (VICTORY_TEXTURE_NO_WAIT=1, which scripts\play.ps1 sets); a texture that arrives while the
+    # runtime remaps may show a frame later.
+    [switch]$TextureWait,
     # Device-removed data (VICTORY_D3D12_DRED, as scripts\play.ps1 sets it): light keeps what a
     # lost device was doing, so the log names the command and pipeline instead of "no
     # breadcrumbs". off leaves it out.
@@ -70,31 +82,33 @@ param(
     # Shader hashes (16 hex digits, comma separated; diag build) whose draws are skipped
     # (VICTORY_SKIP_PIPELINES): to test whether one pipeline is the one that hangs the device.
     [string]$SkipPipelines,
+    # The project's own search for what stops the card (VICTORY_MESH_TEST, diag build): scissor runs
+    # every mesh draw's shaders but rasterises one pixel (a hang that stays is the mesh shader itself,
+    # one that goes is what its triangles cover); skip issues no mesh draw at all; keep:<digit> keeps
+    # only the mesh draws whose shader hash ends in that digit.
+    [string]$MeshTest,
     # Where the log goes (default: logs\ in the repository). -NoLog writes none.
     [string]$LogDir,
     [switch]$NoLog
 )
 
 $profiles = @{
-    Lean     = @{ CardBuffersMB = 128;  TextureCapMB = 768 }
-    Balanced = @{ CardBuffersMB = 512;  TextureCapMB = 1024 }
-    Fast     = @{ CardBuffersMB = 1024; TextureCapMB = 1536 }
+    Lean     = @{ CardBuffersMB = 128;  TextureCapMB = 2048; RoomPercent = 70; ReserveMB = 4096 }
+    Balanced = @{ CardBuffersMB = 512;  TextureCapMB = 0;    RoomPercent = 85; ReserveMB = 3072 }
+    Fast     = @{ CardBuffersMB = 1024; TextureCapMB = 0;    RoomPercent = 92; ReserveMB = 2560 }
 }
-foreach ($name in 'CardBuffersMB', 'TextureCapMB') {
+foreach ($name in 'CardBuffersMB', 'TextureCapMB', 'RoomPercent', 'ReserveMB') {
     if (-not $PSBoundParameters.ContainsKey($name)) { Set-Variable -Name $name -Value $profiles[$Profile][$name] }
 }
-Write-Host "Profile $Profile`: card buffers $CardBuffersMB MB, title-filled texture copies capped at $TextureCapMB MB."
+Write-Host "Profile $Profile`: card buffers $CardBuffersMB MB, texture copies up to $RoomPercent % of the card's budget (cap: $(if ($TextureCapMB) { "$TextureCapMB MB" } else { 'none' })), $ReserveMB MB of RAM kept free."
 
 # Memory knobs (values in MB unless the name says KB). Each one lowers how much is kept
 # ready at once, at the cost of textures arriving a little later.
 $lowMemory = @{
-    # Texture queue stops filling the card at 50 % of its budget (default 90; 50 is the lowest
-    # the layer accepts). Measured: runs 6 to 9 closed the queue near 4.0 to 4.2 GB in use on a
-    # 9.2 GB budget, little below run 5 at 65 % (4.3 GB), because the card room kept for render
-    # targets counts in the same sum. It did not prevent the crash: the growth came after the
-    # queue closed.
+    # Texture queue stops filling the card at -RoomPercent of its budget (layer default 90; 50 is
+    # the lowest it accepts). The card room kept for render targets counts in the same sum.
     # Only works while VICTORY_TEXTURE_BUDGET_MB is unset: that setting skips the budget check.
-    VICTORY_TEXTURE_ROOM_PERCENT      = '50'
+    VICTORY_TEXTURE_ROOM_PERCENT      = [string]$RoomPercent
     # Title buffers copied into card memory: at most -CardBuffersMB, and only buffers of at least 1 MB.
     # The queue also keeps less card room back for these copies.
     VICTORY_CARD_BUFFERS_MB           = [string]$CardBuffersMB
@@ -127,10 +141,13 @@ $lowMemory = @{
 # what was turned down.
 if (-not $NoFastWide) { $lowMemory['VICTORY_FAST_WIDE'] = '1' }
 if (-not $NoMeshStrict) { $lowMemory['VICTORY_MESH_OUTPUT_STRICT'] = '1' }
+if ($MeshTest) { $lowMemory['VICTORY_MESH_TEST'] = $MeshTest }
 if ($SkipPipelines) { $lowMemory['VICTORY_SKIP_PIPELINES'] = $SkipPipelines }
 if ($Dred -ne 'off') { $lowMemory['VICTORY_D3D12_DRED'] = $Dred }
 if ($D3dDebug) { $lowMemory['VICTORY_D3D12_DEBUG'] = '1' }
 if ($Probe) { $lowMemory['VICTORY_INPLACE_PROBE'] = '1' }
+$lowMemory['VICTORY_UMA_RESERVE_MB'] = [string]$ReserveMB
+if (-not $TextureWait) { $lowMemory['VICTORY_TEXTURE_NO_WAIT'] = '1' }
 if ($TextureCapMB -gt 0) { $lowMemory['VICTORY_TEXTURE_BUDGET_MB'] = [string]$TextureCapMB }
 if ($InPlace) {
     $lowMemory['VICTORY_INPLACE'] = '1'
@@ -302,11 +319,16 @@ if ($logPath -and (Test-Path $logPath)) {
             }
             if ($null -ne $stuck -and $tail -match "command $stuck ran (\[[^\]]+\])") {
                 Write-Host "Device-removed data: the first unfinished command is $stuck, running $($Matches[1])."
+                $mesh = [regex]::Match($Matches[1], 'mesh ([0-9a-f]{16})').Groups[1].Value
+                Write-Host 'Same command in several runs means a fault in that draw. To narrow it, rerun with one of:'
+                Write-Host '  -MeshTest scissor   (still hangs: the mesh shader itself; no hang: what its triangles cover)'
+                if ($mesh) { Write-Host "  -SkipPipelines $mesh   (that shader's draws are dropped: some geometry missing)" }
+                Write-Host '  -MeshTest skip      (no mesh draws at all)'
             } elseif ($tail -match 'command (\d+) ran (\[[^\]]+\])') {
                 Write-Host "Device-removed data: near command $($Matches[1]), running $($Matches[2])."
             }
         }
-        Write-Host 'The log says the GPU HUNG (0x887A0006): Windows reset it after about 2 s on one piece of work (TdrDelay). Read the lines after "host GPU device removed" for the command; or give slow frames room (elevated PowerShell, then restart):'
+        Write-Host 'The log says the GPU HUNG (0x887A0006): Windows reset it after TdrDelay seconds on one piece of work. If the time to the reset grows when TdrDelay does (11.9 s at 10 in the run of 2026-11-27, 3.3 s at 2), the draw never finishes: a real hang, not a slow frame. Read the lines after "host GPU device removed" for the command; or give slow frames room (elevated PowerShell, then restart):'
         Write-Host '  reg add HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers /v TdrDelay /t REG_DWORD /d 30 /f'
         Write-Host '  (undo: reg delete HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers /v TdrDelay /f)'
     } elseif ($text -match '0x8007000E') {
