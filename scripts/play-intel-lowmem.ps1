@@ -11,6 +11,10 @@
 # -MinFreeGB    free RAM below which the run is not started (default 20); -Force starts anyway
 # -LogDir / -NoLog   the run is logged to logs\victory-<time>.log (newest 20 kept) with a header
 #               (command, git commit, GPU and driver, env values) and an exit-code summary
+# -Profile      Lean, Balanced (default) or Fast: memory against CPU time (see the parameters below)
+# -MeshTest / -SkipPipelines / -SkipFsr4 / -MeshStrict   experiments for the device removals; the
+#               launcher prints the next ones to try after a hang. scripts\intel-sweep.ps1 runs the
+#               list unattended and prints which settings survive.
 # Extra settings may be passed the same way as play.ps1: -More @{VICTORY_PANEL='1'}
 # Measurements of this profile on Intel hardware: none yet. Check the frame time with
 # VICTORY_PANEL=1 and VRAM in Task Manager before relying on it.
@@ -57,10 +61,17 @@ param(
     [switch]$D3dDebug,
     # Mesh shaders whose outputs pass the host's 32 KiB even at their lane count are refused
     # instead of being emitted anyway (VICTORY_MESH_OUTPUT_STRICT=1; lower.rs says "refuse them
-    # here if one hangs"). On by default here: both runs with device-removed data hung in the same
-    # indirect mesh draw. A refused shader's draws are dropped (geometry missing, no hang).
-    # -NoMeshStrict turns it off.
-    [switch]$NoMeshStrict,
+    # here if one hangs"). Off by default: three runs with it on hung all the same (so it was
+    # not those shaders), and in the dump it refuses 71 character shaders (MS_VS_PedTransform*
+    # with Fire, Decals and Transmission variants), whose draws are then dropped. The host's
+    # driver creates their pipelines (checked offline on the B390).
+    [switch]$MeshStrict,
+    # Skips the draws of the 17 compute shaders the title's FidelityFX FSR4 passes run (and the
+    # three of them that do not translate). All four runs with device-removed data created these
+    # passes at world entry, 10 to 33 s before the device was removed, and none of them is in the
+    # title's files (the loader builds them at run time). A test for whether they are what
+    # corrupts the memory the later mesh draws read; the upscaled picture is missing while on.
+    [switch]$SkipFsr4,
     # CPU side (the log of 2026-11-27: the card was about 25 % busy and the frame waited on the
     # submitting thread; 2.6 GB a frame of title buffer copies were compared on the CPU).
     # VICTORY_FAST_WIDE=1: the helper threads use the 12 cores that share the performance cores'
@@ -140,7 +151,11 @@ $lowMemory = @{
 # measured on this GPU yet: the line "title memory in place" (every 10 s) says what was placed and
 # what was turned down.
 if (-not $NoFastWide) { $lowMemory['VICTORY_FAST_WIDE'] = '1' }
-if (-not $NoMeshStrict) { $lowMemory['VICTORY_MESH_OUTPUT_STRICT'] = '1' }
+if ($MeshStrict) { $lowMemory['VICTORY_MESH_OUTPUT_STRICT'] = '1' }
+if ($SkipFsr4) {
+    $fsr4 = '32aa8384586e0f12,3d147e8190574516,47d8c225abfcb246,528278df1274cb33,55c46e739fa0796a,6a6c7b7fde59134f,80a0178d3a9d8d12,85dea520c893a3d9,8cbd7f5b9ce7530c,8e614708143ef917,8fb5e4aa9c542c3f,ba578b59c8c28a57,c99e30956be0deaf,f46117391dd81461,f5ab5dcf95536794,f7fc6c984427fef3,fdce2a0a9fb1521a,17af85f170e66f30,477b52e73ddeb6f2,8b437ab61d8008fe'
+    $SkipPipelines = if ($SkipPipelines) { "$SkipPipelines,$fsr4" } else { $fsr4 }
+}
 if ($MeshTest) { $lowMemory['VICTORY_MESH_TEST'] = $MeshTest }
 if ($SkipPipelines) { $lowMemory['VICTORY_SKIP_PIPELINES'] = $SkipPipelines }
 if ($Dred -ne 'off') { $lowMemory['VICTORY_D3D12_DRED'] = $Dred }
@@ -324,6 +339,8 @@ if ($logPath -and (Test-Path $logPath)) {
                 Write-Host '  -MeshTest scissor   (still hangs: the mesh shader itself; no hang: what its triangles cover)'
                 if ($mesh) { Write-Host "  -SkipPipelines $mesh   (that shader's draws are dropped: some geometry missing)" }
                 Write-Host '  -MeshTest skip      (no mesh draws at all)'
+                Write-Host '  -SkipFsr4           (the FidelityFX FSR4 compute passes: created 10 to 33 s before every hang so far)'
+                Write-Host '  scripts\intel-sweep.ps1 runs the whole list one after the other and prints which settings survive.'
             } elseif ($tail -match 'command (\d+) ran (\[[^\]]+\])') {
                 Write-Host "Device-removed data: near command $($Matches[1]), running $($Matches[2])."
             }
