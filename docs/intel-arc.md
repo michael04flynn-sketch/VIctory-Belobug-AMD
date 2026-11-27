@@ -482,11 +482,21 @@ translated mesh programs in their own pipelines; the folder made for it had 294,
 buffer holds), `pressure` (12 GB held), `memload` (the CPU streaming memory), `big` (dispatches of up to 216 groups),
 `dred-mixed` and `all` have no log: they compile, pass clippy and were not run.
 
-## The title's own runs, bisected (game, 2026-11-27 15:40 to 16:01, driver 8724, mesh draws on)
+## The title's own runs, bisected (game, 2026-11-27 15:40 to 16:11, driver 8724, mesh draws on)
 
 `scripts\intel-sweep.ps1 -Hold` (new: `-Hold` keeps the card against other launchers' sweeps, `-Repeat n`, `-Only` in
 the order given) with the settings `base-dred`, `exact`, `only-ea2e`, `skip-ea2e`, `ind-zero`, `ind-fence`, `all-zero`
 (`-List`). One run each, 220 s:
+
+**A caveat on four of these runs.** Another session working on the same machine reported afterwards that it compiled
+(`cargo check`, `test` and one 37 s `build`) at times between 15:57 and 16:08, and ran a one-group mesh unit test on the
+hardware device at 16:12. The runs inside that window may have been perturbed by it (the rule on this machine is: no compile
+while a run is going): `ind-fence` (15:55:58 to 15:58:09, its last minute), `ind-zero` (15:58:32), `all-zero` (16:00:20) and
+`dred-off` (16:04:48), and the stress runs `stats`, `copies-2` and `dred-plain` above. The runs before it (`base-dred`,
+`exact` x3, `only-ea2e`, `skip-ea2e`: 15:40 to 15:54) and the one with the twin patch (16:10) were outside it, by that
+session's account. A hang in a perturbed run
+does not show that what the setting left in place is the cause, so the conclusions that rest on those rows are marked below
+and need the runs repeated on a quiet machine.
 
 | Setting | What it does | Result | First unfinished command (device-removed data) |
 |---|---|---|---|
@@ -494,19 +504,20 @@ the order given) with the settings `base-dred`, `exact`, `only-ea2e`, `skip-ea2e
 | `exact` (3 runs) | `VICTORY_MESH_COUNTS=exact` | hung 89, 87, 72 s | `CopyTextureRegion` 31 of 46; then twice `ExecuteIndirect` 107 of 160 (`[mesh ea2eadde55090b27, pixel 3711fdad456538a1]`, 14 s after that pipeline's first bind) |
 | `only-ea2e` | only that mesh program's draws | **survived 220 s** | |
 | `skip-ea2e` | every mesh draw but that program's | hung 68 s | `ExecuteIndirect` 48, `[mesh 85eaffa59a3a6ecf, pixel b352dd911b665364]` |
-| `ind-fence` | a barrier on all work after every indirect mesh execution | hung 131 s | `CopyTextureRegion` 44 of 68, after a barrier |
-| `ind-zero` | every indirect mesh execution issued with a count of 0 | hung 73 s | `CopyTextureRegion` 31 of list 244 |
-| `dred-off` | mesh draws on, `-Dred off` (no auto breadcrumbs at all) | hung 90 s | none kept ("no breadcrumbs"); the device was removed after 11 submissions sent ahead |
+| `ind-fence` | a barrier on all work after every indirect mesh execution | hung 131 s (its last minute in the window) | `CopyTextureRegion` 44 of 68, after a barrier |
+| `ind-zero` | every indirect mesh execution issued with a count of 0 | hung 73 s (in the window) | `CopyTextureRegion` 31 of list 244 |
+| `dred-off` | mesh draws on, `-Dred off` (no auto breadcrumbs at all) | hung 90 s (in the window) | none kept ("no breadcrumbs"); the device was removed after 11 submissions sent ahead |
 | `base`, the depth twins made to wait for their mapping | mesh draws on; `resource.rs` waits with `host::mapped` after `resident` for the two twin textures of a depth texture (see below); not kept | hung 81 s | `CopyTextureRegion` 43 of list 290 |
-| `all-zero` | every mesh draw empty: direct dispatches of 0 groups, indirect counts of 0, all state and bindings as before | **hung 68 s** | `CopyBufferRegion` 58 of 60: the 16-byte copy of the card budget's notes into mapped memory, the last commands of a list (`card_budget_out`), between two barriers |
+| `all-zero` | every mesh draw empty: direct dispatches of 0 groups, indirect counts of 0, all state and bindings as before | **hung 68 s** (in the window) | `CopyBufferRegion` 58 of 60: the 16-byte copy of the card budget's notes into mapped memory, the last commands of a list (`card_budget_out`), between two barriers |
 
 What it says:
 
-- **The stop does not need a mesh shader to run.** With every mesh draw empty the card still stopped (the
-  standalone test, which runs 45 million mesh invocations a second, never did). What the host does for the
-  draws is left: pipelines, root signatures, descriptors, the refresh and copies of what they read.
-- **The first unfinished command is, in 6 of the 9 reports of that evening (the 8 runs above and the 14:54 run
-  of another), a copy that the host records, right after a `ResourceBarrier` that did finish** (so every draw
+- **The stop probably does not need a mesh shader to run (one run, to repeat).** With every mesh draw empty the card still
+  stopped (`all-zero`, in the window above; `ind-zero` agrees, also in it), while the standalone test, which runs 45 million
+  mesh invocations a second, never stopped it. If it holds, what the host does for the draws is left: pipelines, root
+  signatures, descriptors, the refresh and copies of what they read.
+- **The first unfinished command is, in 6 of the 9 reports of that evening (the 8 runs of the unpatched build above and
+  the 14:54 run of another; the run with the twin patch also stopped on a `CopyTextureRegion`), a copy that the host records, right after a `ResourceBarrier` that did finish** (so every draw
   before it had finished): `CopyTextureRegion` (5; two between a pair of barriers each time), `CopyBufferRegion`
   (1). In the other 3 it is a mesh `ExecuteIndirect`. The copies are the host's own (a depth texture's twin
   through a buffer, a texture copied back, the card budget's notes); none is the title's (those carry a marker
@@ -514,8 +525,9 @@ What it says:
 - **One mesh program alone does not do it; any larger set does** (`only-ea2e` lived, `skip-ea2e` died on another
   program): the program stuck in two runs is where the 59th of 109 `ExecuteIndirect`s in a row (no barrier between,
   how the host's batched clamp leaves them) fell, not a program that is wrong.
-- Not the output counts (`exact`: 3 of 3 hung), not the overlap of indirect draws (`ind-fence`), not the device-removed
-  data itself (`dred-off` hung with the auto breadcrumbs off).
+- Not the output counts (`exact`: 3 of 3 hung, before the window). Probably not the overlap of indirect draws (`ind-fence`)
+  and not the device-removed data itself (`dred-off` hung with the auto breadcrumbs off), but each of those is one run, in
+  the window.
 - **A lead in the host's code that was tried and was not it.** `host::mapped` says new card memory is mapped into the
   card's address space after `MakeResident` returns, a GPU access before that is a page fault (two losses of 2026-11-25),
   and the host waits with a copy on a queue of its own. The 45 depth textures' twins (`resource.rs`) are made resident
@@ -562,10 +574,14 @@ formed.
 
 ## Not known yet
 
-- **What the card stops on.** It is not the mesh shaders' work (empty draws stop it), not DRED, not the output counts, not
-  one program, not the overlap of indirect draws; it is a copy the host records at the end of a list, right after a barrier,
-  that does not finish, once mesh draws have been prepared in the list (or a mesh `ExecuteIndirect` in a long run of them).
-  Next steps: `-Dred full` markers on every host copy (twin, copy-back, card budget; `host.rs` has them for the first two now)
+- **What the card stops on.** Not the output counts (3 of 3 runs, unperturbed) and not one program. Probably not the mesh
+  shaders' work (empty draws stop it), not DRED and not the overlap of indirect draws, but each of those three is one run made
+  while another session compiled (`all-zero`, `dred-off`, `ind-fence`). What the reports show is a copy the host records at
+  the end of a list, right after a barrier, that does not finish, once mesh draws have been prepared in the list (or a mesh
+  `ExecuteIndirect` in a long run of them).
+  Next steps: first repeat `all-zero`, `dred-off` and `ind-fence` three times each on a quiet machine
+  (`scripts\intel-sweep.ps1 -Only all-zero,dred-off,ind-fence -Repeat 3 -Seconds 220 -MinFreeGB 16.5 -Hold`, about half an
+  hour of the card); then `-Dred full` markers on every host copy (twin, copy-back, card budget; `host.rs` has them for the first two now)
   to name the stuck one and its resources; a run with the depth twins switched off (`VICTORY_DEPTH_TWINS=nodepth` removes
   only the depth plane's); an Intel driver newer than 8724 (Intel's download page lists newer 32.0.101 builds, 8991 WHQL and 8992 non-WHQL;
   none is installed here); a report to Intel naming the copy once it is known.
