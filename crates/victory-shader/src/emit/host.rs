@@ -633,6 +633,95 @@ impl Host {
     }
 }
 
+/// The vertex shader that draws what the compute twin of the mesh program `ms`
+/// ([`super::translate_twin`]) stored in the arena for one draw: a draw of
+/// `3 * 128 * groups` vertices, vertex `v` of which reads the arena vertex
+/// number the twin stored at byte `4 v` and passes that vertex's outputs on,
+/// with the signature `ms` declares (so the title's pixel shader links as it
+/// does to the mesh program).
+pub fn twin_vs(ms: &HostShader) -> Result<HostShader, String> {
+    use super::bitcode::{Attr, Bin, Cast, Term};
+    let outputs = sig(&ms.dxil, FourCC::OSG1)?;
+    if outputs.is_empty() {
+        return Err("a mesh program with no vertex outputs".into());
+    }
+    let (offsets, scalars) = super::lower::twin_layout(&outputs);
+    let mut s = super::shader::Shader::new(false);
+    s.inputs.push(SigElement {
+        name: "SV_VertexID".into(),
+        index: 0,
+        kind: 1,
+        comp: 5,
+        interp: 0,
+        row: Some(0),
+        col: 0,
+        cols: 1,
+        usage: 1,
+        half: false,
+    });
+    let b = s.entry;
+    let (i32t, void, res_ret) = (s.t.i32, s.t.void, s.t.res_ret);
+    let (zero, undef, align) = (s.m.i32(0), s.m.undef(i32t), s.m.i32(4));
+    let zero8 = s.m.i8(0);
+    let vertex_id = s.op(b, "loadInput.i32", Attr::ReadNone, i32t, 4, &[zero, zero, zero8, undef]);
+    let arena = s.root_uav_handle(super::SLOT_ARENA);
+    // The arena vertex number the twin stored for this corner.
+    let four = s.m.i32(4);
+    let at = s.m.bin(b, Bin::Mul, vertex_id, four);
+    let one = s.m.i8(1);
+    let loaded = s.op(b, "rawBufferLoad.f32", Attr::ReadOnly, res_ret, 139, &[arena, at, undef, one, align]);
+    let number = s.m.extract(b, loaded, 0);
+    let number = s.m.cast(b, Cast::Bitcast, number, i32t);
+    let stride = s.m.i32(4 * scalars);
+    let begin = s.m.i32(super::ARENA_VERTICES);
+    let record = s.m.bin(b, Bin::Mul, number, stride);
+    let record = s.m.bin(b, Bin::Add, record, begin);
+    for (id, e) in outputs.iter().enumerate() {
+        let offset = s.m.i32(4 * offsets[id]);
+        let at = s.m.bin(b, Bin::Add, record, offset);
+        let mask = s.m.i8((1u8 << e.cols) - 1);
+        let loaded = s.op(b, "rawBufferLoad.f32", Attr::ReadOnly, res_ret, 139, &[arena, at, undef, mask, align]);
+        for col in 0..e.cols {
+            let x = s.m.extract(b, loaded, u32::from(col));
+            let (suffix, x) = if e.comp == 9 {
+                (".f32", x)
+            } else {
+                (".i32", s.m.cast(b, Cast::Bitcast, x, i32t))
+            };
+            let (element, column) = (s.m.i32(id as u32), s.m.i8(col));
+            s.op(b, &format!("storeOutput{suffix}"), Attr::NoUnwind, void, 5, &[element, zero, column, x]);
+        }
+    }
+    s.outputs = outputs
+        .into_iter()
+        .map(|mut e| {
+            e.usage = (1 << e.cols) - 1;
+            e
+        })
+        .collect();
+    s.m.terminate(b, Term::Ret);
+    let root_uavs = s.root_uavs.iter().map(|r| r.0).collect();
+    Ok(HostShader {
+        stage: crate::native::HwStage::Vs,
+        dxil: s.finish(),
+        user_data: Vec::new(),
+        samplers: Vec::new(),
+        static_samplers: Vec::new(),
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+        root_uavs,
+        root_indexed_views: Vec::new(),
+    })
+}
+
+/// The most groups of one draw the arena has room for when the twin of the
+/// mesh program `ms` stores them (its vertex record sets the size of a group).
+pub fn twin_groups(ms: &HostShader) -> Result<u32, String> {
+    let outputs = sig(&ms.dxil, FourCC::OSG1)?;
+    let (_, scalars) = super::lower::twin_layout(&outputs);
+    Ok(super::arena_groups(4 * scalars.max(1)))
+}
+
 /// A vertex shader that feeds `ps`'s inputs (zeros) and a position.
 pub fn stub_vs(ps: &HostShader) -> Result<HostShader, String> {
     let inputs = sig(&ps.dxil, FourCC::ISG1)?;
