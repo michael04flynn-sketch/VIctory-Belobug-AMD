@@ -147,6 +147,14 @@ if ($freeNow -lt $MinFreeGB -and -not $Force) {
     exit 2
 }
 
+# Windows resets a GPU that works on one piece for longer than TdrDelay (default 2 s). Runs on the
+# Arc B390 had world frames of 0.4 to 3.1 s, and the last two were lost to a hung device (0x887A0006)
+# in a list of mesh draws. Read-only check; the launcher never changes it.
+$tdr = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' -ErrorAction SilentlyContinue).TdrDelay
+if (-not $tdr -or $tdr -lt 10) {
+    Write-Host "Note: TdrDelay is $(if ($tdr) { "$tdr s" } else { 'not set (2 s)' }). A slow world frame can be reset as a hang; to give it room, elevated: reg add HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers /v TdrDelay /t REG_DWORD /d 30 /f   (then restart)"
+}
+
 # Settings left over in this window from an earlier run (an older version of this script, or
 # -InPlace last time) go; where your files are stays. Pass what you want with -More.
 $paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_FIDELITYFX_DIR'
@@ -225,6 +233,11 @@ Write-Host $summary
 if ($logPath -and (Test-Path $logPath)) {
     $text = Get-Content $logPath -Raw
     if ($text -match '0x887A0006') {
+        # The first command the device-removed data names as running (a list of commands that did not finish).
+        $after = $text.IndexOf('device-removed data')
+        if ($after -ge 0 -and $text.Substring($after) -match 'command (\d+) ran (\[[^\]]+\])') {
+            Write-Host "Device-removed data: the hung list was at about command $($Matches[1]) (the first the data names), running $($Matches[2])."
+        }
         Write-Host 'The log says the GPU HUNG (0x887A0006): Windows reset it after about 2 s on one piece of work (TdrDelay). Read the lines after "host GPU device removed" for the command; or give slow frames room (elevated PowerShell, then restart):'
         Write-Host '  reg add HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers /v TdrDelay /t REG_DWORD /d 30 /f'
         Write-Host '  (undo: reg delete HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers /v TdrDelay /f)'
