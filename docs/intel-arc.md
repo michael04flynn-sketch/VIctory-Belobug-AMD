@@ -179,6 +179,25 @@ buffers on the card means more system memory used (written buffers count twice),
 the CPU; those are the two numbers to compare between settings. None of this can matter until a
 run gets past the hang at the mesh draw above.
 
+## Memory against CPU time: launcher profiles
+
+What the seventh run (128 MB card buffers, 1024 MB texture cap, no wide helpers) reached before the
+hang, from its log and `.mem.csv`: lowest free RAM 6.2 GB, peak `victory.exe` working set 18.0 GB,
+card use 8.3 GB at frame 1132 (budget 14,978 MB, which follows free RAM on this GPU). Of that
+8.3 GB: 3.2 GB shared buffer copies (4,622 buffers), 1.8 GB texture blocks, 2.1 GB host copies
+(1.0 GB of them title-filled textures, now capped), 0.7 GB upload buffers, 0.3 GB staging.
+The 1024 MB cap did what it says: title-filled texture copies 2,451 MB (uncapped, fourth run)
+against 1,039 MB.
+
+CPU time and memory pull the other way. A card copy of a title buffer keeps a CPU-side copy and a
+card-side copy (a third, "before", when shaders write it), all system memory on this GPU, in return
+for the card comparing it instead of the CPU (2.6 GB a frame were compared on the CPU). So the
+launcher has `-Profile Lean` (128 / 768 MB: least memory), `Balanced` (512 / 1024, default) and
+`Fast` (1024 / 1536), setting `-CardBuffersMB` and `-TextureCapMB` unless they are passed. After a run
+it prints the lowest free RAM and peak working set next to the card-busy and CPU-compare figures, so
+two profiles can be compared on the same four numbers. Which profile is better on this machine is
+not known: no run has lived long enough to measure frame time.
+
 ## Not known yet
 
 - Whether the process itself or other programs took the RAM (the `.mem.csv` of the next run).
