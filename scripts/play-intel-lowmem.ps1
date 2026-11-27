@@ -4,7 +4,10 @@
 # and system memory (RAM). play.ps1 has no -Console parameter, so it is not used here.
 #   scripts\play-intel-lowmem.ps1 -Exe <path of your own copy's executable>
 # -Build        release (the default, faster) or diag
-# -InPlace      use title memory in place instead of copying it (VICTORY_INPLACE=1)
+# -InPlace      use title memory in place instead of copying it (VICTORY_INPLACE=1). Run of 2026-11-27: it
+#               placed 352 MB and turned down 237 windows (page-pool view memory, which the host
+#               cannot open as a heap), so it did not reduce the first-frame memory burst.
+# -Probe        also log which title memory blocks -InPlace (a census 30 s and 150 s into the run)
 # -MinFreeGB    free RAM below which the run is not started (default 20); -Force starts anyway
 # -LogDir / -NoLog   the run is logged to logs\victory-<time>.log (newest 20 kept) with a header
 #               (command, git commit, GPU and driver, env values) and an exit-code summary
@@ -24,6 +27,8 @@ param(
     [double]$MinCommitGB = 20,
     # Use title memory in place instead of copying it (VICTORY_INPLACE=1, see below).
     [switch]$InPlace,
+    # Also log what kind of title memory blocks -InPlace (VICTORY_INPLACE_PROBE=1: a census 30 s and 150 s in).
+    [switch]$Probe,
     # Where the log goes (default: logs\ in the repository). -NoLog writes none.
     [string]$LogDir,
     [switch]$NoLog
@@ -69,6 +74,7 @@ $lowMemory = @{
 # and that growth filled the card's budget. The cap rises to 3072 MB so the windows fit. Not
 # measured on this GPU yet: the line "title memory in place" (every 10 s) says what was placed and
 # what was turned down.
+if ($Probe) { $lowMemory['VICTORY_INPLACE_PROBE'] = '1' }
 if ($InPlace) {
     $lowMemory['VICTORY_INPLACE'] = '1'
     $lowMemory['VICTORY_INPLACE_MB'] = '3072'
