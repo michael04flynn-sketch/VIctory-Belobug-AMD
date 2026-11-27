@@ -1169,6 +1169,202 @@ impl Host {
     }
 }
 
+/// What [`Host::draw_twin`] runs: a mesh program's compute twin and the
+/// vertex+pixel pipeline that draws its arena.
+#[cfg(test)]
+pub struct TwinDraw<'a> {
+    /// The twin's compute pipeline (root parameter 0: user data, 1: the arena).
+    pub compute: &'a (ID3D12RootSignature, ID3D12PipelineState),
+    /// The vertex and pixel pipeline ([`Host::pipeline`] of [`twin_vs`] and a
+    /// pixel shader: root parameters 0 and 1 user data, 2 the arena).
+    pub graphics: &'a (ID3D12RootSignature, ID3D12PipelineState),
+    pub groups: u32,
+    pub size: (u32, u32),
+}
+
+#[cfg(test)]
+impl Host {
+    /// Runs a mesh program's compute twin for `groups` groups, then draws the
+    /// arena it wrote (`3 * 128 * groups` vertices) into an RGBA32F target
+    /// and returns its texels.
+    pub fn draw_twin(&self, d: &TwinDraw) -> Result<Vec<[f32; 4]>, String> {
+        let dev = &self.device;
+        let (w, h) = d.size;
+        // SAFETY: D3D12 calls with descriptions that outlive them; resources
+        // are kept alive until the fence says the GPU is done.
+        unsafe {
+            let queue: ID3D12CommandQueue = dev
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .map_err(err)?;
+            let alloc: ID3D12CommandAllocator = dev
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .map_err(err)?;
+            let list: ID3D12GraphicsCommandList = dev
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &d.compute.1)
+                .map_err(err)?;
+            let buffer = |size: u64, flags| D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: size,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: flags,
+                ..Default::default()
+            };
+            let make = |props: D3D12_HEAP_TYPE,
+                        desc: &D3D12_RESOURCE_DESC,
+                        state,
+                        clear: Option<&D3D12_CLEAR_VALUE>| {
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: props, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    desc,
+                    state,
+                    clear.map(|c| c as *const _),
+                    &mut r,
+                )
+                .map_err(err)?;
+                r.ok_or_else(|| "no resource".to_string())
+            };
+            let arena = make(
+                D3D12_HEAP_TYPE_DEFAULT,
+                &buffer(u64::from(super::ARENA_BYTES), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                None,
+            )?;
+            let arena_at = arena.GetGPUVirtualAddress();
+            let target = make(
+                D3D12_HEAP_TYPE_DEFAULT,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: u64::from(w),
+                    Height: h,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                Some(&D3D12_CLEAR_VALUE {
+                    Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                    Anonymous: D3D12_CLEAR_VALUE_0 { Color: [0.0; 4] },
+                }),
+            )?;
+            let rtv_heap: ID3D12DescriptorHeap = dev
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                    NumDescriptors: 1,
+                    ..Default::default()
+                })
+                .map_err(err)?;
+            let rtv = rtv_heap.GetCPUDescriptorHandleForHeapStart();
+            dev.CreateRenderTargetView(&target, None, rtv);
+            let uav_barrier = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(None),
+                    }),
+                },
+            };
+            // The twin: user data zeros, the arena.
+            list.SetComputeRootSignature(&d.compute.0);
+            list.SetPipelineState(&d.compute.1);
+            list.SetComputeRoot32BitConstants(0, 1, [0u32].as_ptr().cast(), 0);
+            list.SetComputeRootUnorderedAccessView(1, arena_at);
+            list.Dispatch(d.groups, 1, 1);
+            list.ResourceBarrier(&[uav_barrier]);
+            // The draw: the arena through the vertex shader.
+            list.SetGraphicsRootSignature(&d.graphics.0);
+            list.SetPipelineState(&d.graphics.1);
+            list.SetGraphicsRoot32BitConstants(0, 1, [0u32].as_ptr().cast(), 0);
+            list.SetGraphicsRoot32BitConstants(1, 1, [0u32].as_ptr().cast(), 0);
+            list.SetGraphicsRootUnorderedAccessView(2, arena_at);
+            list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            list.RSSetViewports(&[D3D12_VIEWPORT {
+                Width: w as f32,
+                Height: h as f32,
+                MaxDepth: 1.0,
+                ..Default::default()
+            }]);
+            list.RSSetScissorRects(&[windows::Win32::Foundation::RECT {
+                right: w as i32,
+                bottom: h as i32,
+                ..Default::default()
+            }]);
+            list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list.DrawInstanced(3 * 128 * d.groups, 1, 0, 0);
+            list.ResourceBarrier(&[transition(
+                &target,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            let pitch = (w as usize * 16).next_multiple_of(256);
+            let readback = make(
+                D3D12_HEAP_TYPE_READBACK,
+                &buffer((pitch * h as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+            )?;
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&readback),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                            Width: w,
+                            Height: h,
+                            Depth: 1,
+                            RowPitch: pitch as u32,
+                        },
+                    },
+                },
+            };
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&target),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            list.Close().map_err(err)?;
+            queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
+            queue.Signal(&fence, 1).map_err(err)?;
+            while fence.GetCompletedValue() < 1 {
+                if let Err(e) = dev.GetDeviceRemovedReason() {
+                    return Err(format!("device removed: {}", err(e)));
+                }
+                std::thread::yield_now();
+            }
+            if let Err(e) = dev.GetDeviceRemovedReason() {
+                return Err(format!("device removed: {}", err(e)));
+            }
+            let mut p = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut p)).map_err(err)?;
+            let mut out = Vec::with_capacity((w * h) as usize);
+            for y in 0..h as usize {
+                out.extend_from_slice(std::slice::from_raw_parts(
+                    p.cast::<u8>().add(y * pitch).cast::<[f32; 4]>(),
+                    w as usize,
+                ));
+            }
+            readback.Unmap(0, None);
+            Ok(out)
+        }
+    }
+}
+
 #[cfg(test)]
 fn transition(
     r: &ID3D12Resource,

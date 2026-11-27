@@ -2145,6 +2145,59 @@ mod tests {
         }
     }
 
+    /// A mesh program's compute twin and the vertex shader that draws its
+    /// arena, on WARP (never on the hardware device: this is the test that
+    /// must not touch the card's mesh pipeline): the triangle that covers the
+    /// target lights every texel as the mesh program's own draw does, with the
+    /// edge flags set or not, and the culled one lights none.
+    #[test]
+    #[cfg(windows)]
+    fn a_twin_draws_what_its_mesh_program_draws_on_warp() {
+        use super::host::{Host, TwinDraw};
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Ok(host) = Host::new(true) else {
+            eprintln!("no SM 6.6 WARP device; skipped");
+            return;
+        };
+        let ps = HostShader {
+            stage: HwStage::Ps,
+            dxil: constant_color(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            root_indexed_views: Vec::new(),
+        };
+        for (prim, culled) in [
+            (TRIANGLE, false),
+            (TRIANGLE | EDGE_FLAGS, false),
+            (TRIANGLE | EDGE_FLAGS | CULL, true),
+        ] {
+            let ms = triangle_mesh(prim).unwrap();
+            let mut twin = lower::with_twin(|| triangle_mesh(prim)).unwrap();
+            twin.stage = HwStage::Cs;
+            let vs = super::host::twin_vs(&ms).unwrap();
+            let compute = host.compute_pipeline(&twin).unwrap_or_else(|e| panic!("{prim:#x}: twin pipeline: {e}"));
+            let graphics = host.pipeline(&vs, &ps).unwrap_or_else(|e| panic!("{prim:#x}: drawing pipeline: {e}"));
+            let texels = host
+                .draw_twin(&TwinDraw { compute: &compute, graphics: &graphics, groups: 1, size: (16, 16) })
+                .unwrap_or_else(|e| panic!("{prim:#x}: draw: {e}"));
+            let lit = texels.iter().filter(|t| t[3] != 0.0).count();
+            if culled {
+                assert_eq!(lit, 0, "{prim:#x}: a culled triangle lit texels");
+                continue;
+            }
+            assert!(
+                texels.iter().all(|t| *t == [1.0, 0.5, 0.25, 1.0]),
+                "{prim:#x}: {lit} of 256 texels lit"
+            );
+        }
+    }
+
     /// A pixel shader interpolating at sample positions (PERSP_SAMPLE
     /// barycentrics, `SPI_PS_INPUT_ADDR` bit 0) runs at sample frequency:
     /// DXC's PSV0 says so in PSInfo.SampleFrequency (runtime info byte 1)
