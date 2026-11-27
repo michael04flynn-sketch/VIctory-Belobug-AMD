@@ -229,6 +229,41 @@ that stays is the mesh shader itself, one that goes is what its triangles cover)
 no mesh draw, `keep:<digit>` keeps only shaders whose hash ends in that digit. After a hang the
 launcher prints the three next steps for the named command.
 
+## Ninth run (2026-11-27 01:08, Balanced, `TdrDelay` 10): into the world, textures missing
+
+The first run that lived into the game: 125 s, 1,543 frames; about 35 s of loading screens at 30 fps,
+then the world at 6.6 s and 3.7 s a frame (0.2 to 0.3 fps). Ended with the device removed again,
+this time at a different draw: list 339 (the 25-list submission had been prepared for 16.4 s, the
+reset came with `TdrDelay` 10), 44 of 73 commands done, the first unfinished one among eight mesh
+pipelines (`[mesh a26422c01dcf5612, pixel 6a3a8d3fe52b4eab]`, `[mesh 3b408d7e675fddc5, ...]`, ... and
+a vertex one). So mesh draws hang on this GPU at more than one place, not at one shader only.
+
+Why the textures were missing, from the log:
+
+- `VICTORY_TEXTURE_BUDGET_MB=1024` (the launcher's cap) is a hard stop. Title-filled copies reached
+  1,088 MB, then "passes that made none for lack of room: 599" and "2,930 title textures have no host
+  copy yet (5,632 MB of title memory)". Nothing was let go to make room, because the sweep goes by
+  the card's budget (14,978 MB) and the card was at 8.5 GB. Fixed: no hard cap by default.
+- Waiting on the runtime: "texture refreshes per frame, all threads: 13,519 ms, of them 13,486 ms
+  waiting for title memory to hold still (the runtime remapping it)". `texture.rs` describes this
+  exact case and its remedy, `VICTORY_TEXTURE_NO_WAIT=1`, which `scripts\play.ps1` sets and this
+  launcher did not. Now on (`-TextureWait` restores the wait). Textures may arrive a frame later.
+- Dropped draws (the frame line says 4,180 at worst, 1,466 later): 1,457 a frame are the ray-tracing
+  builder, which is off. The rest are compute passes: `477b52e73ddeb6f2`, `17af85f170e66f30`,
+  `8b437ab61d8008fe` do not translate ("a lane mask exchanged where not every lane runs is not
+  supported", the three of the first shader run), and `02384a60fda6f2d0`, `2da4beb386509b77`,
+  `369cbe906ea72764` translate but the host refuses them (`0x80070057`). Six compute passes missing
+  from every frame can explain some of the see-through geometry. `-D3dDebug` (needs the Graphics Tools
+  feature) names why the host refuses the three; the three lane-mask ones need translator work.
+
+The memory limit on this GPU is the free RAM, not the card's budget (the system's figure follows
+free RAM: 9,208 MB in one run, 14,978 MB in another). The host now works the budget out as the
+system's or, if less, what the process uses plus the free RAM less a reserve
+(`VICTORY_UMA_RESERVE_MB`, set by the profile: 4,096 / 3,072 / 2,560 MB). The texture queue and the
+sweep that lets idle copies go both use it, so copies stop and idle ones go before the PC runs out.
+The profiles are Lean (cap 2,048 MB, 70 %), Balanced (no cap, 85 %, the default) and Fast (92 %).
+None of this has been run in game.
+
 ## Not known yet
 
 - Whether the process itself or other programs took the RAM (the `.mem.csv` of the next run).
