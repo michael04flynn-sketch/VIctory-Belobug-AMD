@@ -1,2 +1,9 @@
 [alias]
 xtask = "run --quiet --package xtask --"
+
+# The victory-gpu tests share process-wide state and one Direct3D device, and fail at random
+# when they run in parallel (a different test each time: watch::*, shader builds, placed
+# textures; seen on the original code too). One at a time they pass every run: about 27 s
+# instead of 13 s. `RUST_TEST_THREADS=8 cargo test` still overrides this (force is off).
+[env]
+RUST_TEST_THREADS = "1"

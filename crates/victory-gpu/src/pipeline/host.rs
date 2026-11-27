@@ -610,6 +610,25 @@ impl HostPipeline {
                 },
             )
         };
+        // What a refused pipeline was made of, for the warning: a host's "The parameter is
+        // incorrect" says nothing without the debug layer.
+        let describe = || -> String {
+            let parts: Vec<String> = (0..stages.len().min(3))
+                .filter_map(|i| stages.get(i).and_then(|(s, _)| s.translated()).map(|t| (i, t)))
+                .map(|(i, t)| {
+                    format!(
+                        "stage {i}: dxil {} B, user data {} dwords, root cbv/srv/uav {}/{}/{}, static samplers {}",
+                        t.host.dxil.len(),
+                        t.host.user_data_dwords(),
+                        t.host.root_cbvs.len(),
+                        t.host.root_srvs.len(),
+                        t.host.root_uavs.len(),
+                        t.host.static_samplers.len()
+                    )
+                })
+                .collect();
+            format!("{}; root parameters {}, samplers {}", parts.join("; "), params.len(), samplers.len())
+        };
         if compute.is_some() {
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 // SAFETY: a borrowed pointer the description never releases.
@@ -628,7 +647,7 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                    tracing::warn!(error = %e, ?shaders, made_of = %describe(), "host pipeline refused");
                     host.log_messages();
                     return None;
                 }
@@ -787,7 +806,7 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                tracing::warn!(error = %e, ?shaders, made_of = %describe(), "host pipeline refused");
                 host.log_messages();
                 return None;
             }

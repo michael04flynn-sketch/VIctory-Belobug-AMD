@@ -9170,6 +9170,12 @@ impl Host {
         {
             crate::book::made(b, || "an upload buffer".into());
         }
+        #[cfg(all(windows, feature = "diagnostics"))]
+        if made.is_ok()
+            && let Some(b) = &buffer
+        {
+            crate::copystat::track_buffer(b, 0, size);
+        }
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
@@ -10056,7 +10062,11 @@ impl Host {
                 last[2] >> 20
             );
             self.log_video_memory("right after that change");
+            #[cfg(all(windows, feature = "diagnostics"))]
+            crate::copystat::card_line("budget changed", own.Budget, own.CurrentUsage);
         }
+        #[cfg(all(windows, feature = "diagnostics"))]
+        crate::copystat::card_growth(own.Budget, own.CurrentUsage);
         Some([own.Budget, own.CurrentUsage, shared.Budget, shared.CurrentUsage])
     }
 
@@ -10154,6 +10164,12 @@ impl Host {
             && let Some(b) = &buffer
         {
             crate::book::made(b, || "a shared buffer".into());
+        }
+        #[cfg(all(windows, feature = "diagnostics"))]
+        if made.is_ok()
+            && let Some(b) = &buffer
+        {
+            crate::copystat::track_buffer(b, 1, size);
         }
         match made {
             Ok(()) => Some((buffer?, data.cast())),

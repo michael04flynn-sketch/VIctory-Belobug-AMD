@@ -440,6 +440,10 @@ fn pipeline<'a>(this: This) -> &'a Pipeline {
     unsafe { &*this.cast::<Pipeline>() }
 }
 
+/// Pipelines first bound by a list since the start, for the card line
+/// (`copystat`).
+pub(crate) static FIRST_BINDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// List method: logs each pipeline's shaders the first time a list binds
 /// it, so a run lists the shaders its frames need first.
 pub(crate) fn bound(this: This) {
@@ -450,6 +454,7 @@ pub(crate) fn bound(this: This) {
     if p.bound.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    FIRST_BINDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let frame = crate::frame::current();
     for shader in &p.shaders {
         tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");

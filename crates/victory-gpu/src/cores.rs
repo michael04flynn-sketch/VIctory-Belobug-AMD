@@ -148,6 +148,37 @@ fn fast_of(sets: &[(u32, u8, u8)]) -> Vec<u32> {
     fast_sets(sets, true)
 }
 
+/// `VICTORY_FAST_WIDE=1`: the threads a frame shares its work with may use more than the fast
+/// class when that is only a few cores. A part with four performance cores and eight efficiency
+/// cores on the same cache (Core Ultra X9 388H, also four low-power cores on a cache of their
+/// own) left every helper to four cores while the other eight stood idle. Off by default; not
+/// measured on a title yet.
+fn wide_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FAST_WIDE").is_some_and(|v| v == "1"))
+}
+
+/// The helpers' sets under [`wide_on`]: those sharing the largest cache the fast sets have, when
+/// that is more than the fast sets (`l3`: bytes by set id); none otherwise.
+fn wide_by_cache(sets: &[(u32, u8, u8)], fast: &[u32], l3: &[(u32, u32)]) -> Vec<u32> {
+    let size = |id: u32| l3.iter().find(|s| s.0 == id).map_or(0, |s| s.1);
+    let Some(want) = fast.iter().map(|&id| size(id)).max().filter(|&s| s > 0) else {
+        return Vec::new();
+    };
+    // (The fast sets stay in whatever their own caches are.)
+    let wide: Vec<u32> = sets.iter().filter(|s| size(s.0) == want || fast.contains(&s.0)).map(|s| s.0).collect();
+    if wide.len() > fast.len() { wide } else { Vec::new() }
+}
+
+/// [`wide_by_cache`] if [`wide_on`], the fast class is under six sets and the caches are known.
+fn wide_helpers(sets: &[(u32, u8, u8)], fast: &[u32]) -> Vec<u32> {
+    if !wide_on() || fast.is_empty() || fast.len() >= 6 {
+        return Vec::new();
+    }
+    static L3: std::sync::OnceLock<Vec<(u32, u32)>> = std::sync::OnceLock::new();
+    wide_by_cache(sets, fast, L3.get_or_init(l3_of_sets))
+}
+
 /// The sets of one fast core of the last, and all the others, for
 /// [`lane_core`]; `None` with fewer than six fast cores.
 fn one_core(sets: &[(u32, u8, u8)]) -> Option<(Vec<u32>, Vec<u32>)> {
@@ -173,8 +204,9 @@ fn lane_core() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LANE_CORE").is_some_and(|v| v == "1"))
 }
 
-/// Threads that asked: a handle of each, and whether it is the submitting one.
-static ASKED: std::sync::Mutex<Vec<(usize, bool)>> = std::sync::Mutex::new(Vec::new());
+/// Threads that asked: a handle of each, whether it is the submitting one, and the stage it
+/// asked from (1: a frame waits for it; 2: it shares work with those; 3: the rest).
+static ASKED: std::sync::Mutex<Vec<(usize, bool, u32)>> = std::sync::Mutex::new(Vec::new());
 
 /// What the threads of the process, and those that asked, are told now
 /// ([`lane_core`], which may have changed).
@@ -193,13 +225,23 @@ pub(crate) fn settle() {
         let at = if others.is_empty() { null } else { others.as_ptr() };
         SetProcessDefaultCpuSets(GetCurrentProcess(), at, others.len() as u32);
     }
-    let helpers: Vec<u32> = match &one {
-        Some((own, _)) => fast.iter().copied().filter(|id| !own.contains(id)).collect(),
-        None => fast.clone(),
+    // Where the fast class is few cores (`VICTORY_FAST_WIDE=1`), the helpers also run on the
+    // slower cores that share the fast cores' cache; the submitting thread stays on the fast ones.
+    let wide = wide_helpers(&sets, &fast);
+    let without_own = |from: &[u32]| -> Vec<u32> {
+        match &one {
+            Some((own, _)) => from.iter().copied().filter(|id| !own.contains(id)).collect(),
+            None => from.to_vec(),
+        }
     };
-    for &(thread, lane) in ASKED.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+    // The threads a frame waits for one by one (stage 1) stay on the fast cores; the threads
+    // they share their work with (stage 2 and up) may take the wide set.
+    let narrow = without_own(&fast);
+    let helpers = if wide.is_empty() { narrow.clone() } else { without_own(&wide) };
+    for &(thread, lane, from) in ASKED.lock().unwrap_or_else(|e| e.into_inner()).iter() {
         let sets = match &one {
             Some((own, _)) if lane => own,
+            _ if lane || from < 2 => &narrow,
             _ => &helpers,
         };
         // SAFETY: a handle kept open, and the system's own set ids.
@@ -208,6 +250,7 @@ pub(crate) fn settle() {
     tracing::info!(on = one.is_some(), core = ?one.as_ref().map(|o| &o.0), "the submitting thread has a core of its own (VICTORY_LANE_CORE)");
     tracing::info!(
         fast = fast.len(),
+        wide = wide.len(),
         of = sets.len(),
         by_cache = fast_by_class(&sets).is_empty() && !fast.is_empty(),
         threads = ASKED.lock().unwrap_or_else(|e| e.into_inner()).len(),
@@ -270,7 +313,7 @@ fn ask(what: &str, from: u32) {
         tracing::warn!(what, error = %std::io::Error::last_os_error(), "the thread could not be kept on the fast cores");
         return;
     }
-    ASKED.lock().unwrap_or_else(|e| e.into_inner()).push((thread as usize, what == "victory-submit"));
+    ASKED.lock().unwrap_or_else(|e| e.into_inner()).push((thread as usize, what == "victory-submit", from));
     settle();
     tracing::info!(what, fast = fast.len(), of, "the thread is kept on the fast cores (VICTORY_FAST_CORES=0: not)");
 }
@@ -320,6 +363,27 @@ mod tests {
         // A larger cache of under eight sets: nothing.
         let few: Vec<(u32, u32)> = (0..32).map(|i| (256 + i, if i < 4 { 64 * MB } else { 32 * MB })).collect();
         assert!(fast_by_cache(&sets, &few).is_empty());
+    }
+
+    #[test]
+    fn wide_helpers_take_the_slower_cores_on_the_fast_cores_cache() {
+        // Four performance cores (class 1) and eight efficiency cores on one cache,
+        // four low-power cores on a cache of their own (Core Ultra X9 388H).
+        let sets: Vec<(u32, u8, u8)> = (0..16).map(|n| (256 + n, u8::from(n < 4), n as u8)).collect();
+        let l3: Vec<(u32, u32)> = (0..16).map(|n| (256 + n, if n < 12 { 18 * MB } else { 4 * MB })).collect();
+        let fast = fast_by_class(&sets);
+        assert_eq!(fast, (256..260).collect::<Vec<_>>());
+        assert_eq!(wide_by_cache(&sets, &fast, &l3), (256..268).collect::<Vec<_>>());
+        // Caches not known: nothing. All alike: every set shares the fast sets' cache.
+        assert!(wide_by_cache(&sets, &fast, &[]).is_empty());
+        let alike_l3: Vec<(u32, u32)> = (0..16).map(|n| (256 + n, 18 * MB)).collect();
+        assert_eq!(wide_by_cache(&sets, &fast, &alike_l3).len(), 16);
+        // Fast sets with caches of their own sizes stay in the result.
+        let odd: Vec<(u32, u32)> = (0..16).map(|n| (256 + n, if n == 0 { 8 * MB } else if n < 12 { 18 * MB } else { 4 * MB })).collect();
+        assert_eq!(wide_by_cache(&sets, &fast, &odd), (256..268).collect::<Vec<_>>());
+        // The fast sets already hold the whole cache: nothing to add.
+        let only: Vec<(u32, u32)> = (0..16).map(|n| (256 + n, if n < 4 { 18 * MB } else { 4 * MB })).collect();
+        assert!(wide_by_cache(&sets, &fast, &only).is_empty());
     }
 
     #[test]
