@@ -74,6 +74,25 @@ CPU meter: a core's counters went backwards between two looks (a parked core on 
 A panic there cannot unwind and aborted the process (exit 0xC0000409). Fixed: such a look counts
 as an idle core, and a panel failure is caught and logged instead of ending the run.
 
+## Fourth run (2026-11-27, panel fixed, 1 GiB texture floor)
+
+Reached the first world frame (frame 1001, 53 s) and ended with the device removed (0x887A0005,
+after 0x887A0006: a 3.4 s stall preparing one submission, with free RAM at 1.2 GB).
+
+- This time the GPU's local budget was 14,978 MB, not 9,208 MB: on a UMA GPU it follows free
+  RAM, so it is no limit worth going by. The card's own use peaked at 9.0 GB, well under it.
+- The limit was physical RAM. `victory.exe` working set went from 6.4 GB to 19.8 GB (private
+  bytes 7.5 to 15.6 GB) in about 15 s; free RAM from 13.6 GB to 1.2 GB, with Memory Compression
+  active. Before the run there were 20.8 GB free.
+- Of that growth the card's accounting explains about 3.4 GB; the rest is title memory touched
+  as the world loads, which the host does not control.
+- The 1 GiB floor did not hold the title-filled texture copies down (2,451 MB were made): the
+  layer's rule beyond the floor goes by the budget, which was large.
+
+Changes for it, in the launcher: `-TextureCapMB` (default 1024, sets `VICTORY_TEXTURE_BUDGET_MB`)
+and `-MinFreeGB` 23. Not measured. With 31 GB of RAM this machine is at the edge: the title needs
+about 20 GB of working set by the first world frame.
+
 ## Not known yet
 
 - Whether the process itself or other programs took the RAM (the `.mem.csv` of the next run).

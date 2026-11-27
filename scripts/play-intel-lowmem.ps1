@@ -19,9 +19,10 @@ param(
     [ValidateSet('diag', 'release')][string]$Build = 'release',
     [hashtable]$More = @{},
     # Free RAM (GB) below which the run is not started (-Force: start anyway).
-    # (20: the run of 2026-11-27 started with 17.9 GB free on 31 GB and ended with the card out
-    # of memory in the first world frame, with 2.9 GB free at that moment.)
-    [double]$MinFreeGB = 20,
+    # (23: on 2026-11-27 four runs on 31 GB all ended in the first world frame. The one with
+    # 20.8 GB free before the run peaked at a working set of 19.8 GB and ended with 1.2 GB free;
+    # the title's own memory (about 8 GB of private growth) is not something the host can cut.)
+    [double]$MinFreeGB = 23,
     [switch]$Force,
     # Free commit (RAM + pagefile, GB) below which the run is not started.
     [double]$MinCommitGB = 20,
@@ -29,6 +30,12 @@ param(
     [switch]$InPlace,
     # Also log what kind of title memory blocks -InPlace (VICTORY_INPLACE_PROBE=1: a census 30 s and 150 s in).
     [switch]$Probe,
+    # Cap (MB) on the host copies of textures the title fills (VICTORY_TEXTURE_BUDGET_MB; 0 = no
+    # cap, the layer's own rule). On a shared-memory GPU the layer's rule goes by the system's
+    # budget, which was 14,978 MB in the last run: it let 2,451 MB of such copies be made and
+    # the first world frame then needed about 13 GB more than the title's start. Textures
+    # beyond the cap arrive later or not at all; raise it if they stay blurry.
+    [int]$TextureCapMB = 1024,
     # Where the log goes (default: logs\ in the repository). -NoLog writes none.
     [string]$LogDir,
     [switch]$NoLog
@@ -75,6 +82,7 @@ $lowMemory = @{
 # measured on this GPU yet: the line "title memory in place" (every 10 s) says what was placed and
 # what was turned down.
 if ($Probe) { $lowMemory['VICTORY_INPLACE_PROBE'] = '1' }
+if ($TextureCapMB -gt 0) { $lowMemory['VICTORY_TEXTURE_BUDGET_MB'] = [string]$TextureCapMB }
 if ($InPlace) {
     $lowMemory['VICTORY_INPLACE'] = '1'
     $lowMemory['VICTORY_INPLACE_MB'] = '3072'
