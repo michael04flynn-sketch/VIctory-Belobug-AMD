@@ -223,6 +223,16 @@ unsafe fn wait_for_all(host: &Host, list: &ID3D12GraphicsCommandList) {
     }
 }
 
+/// Everything recorded so far on `list` is done, and seen, before what follows
+/// (a barrier on all work and all memory): for experiments on draws that
+/// overlap.
+pub(crate) fn sync_all(list: &ID3D12GraphicsCommandList) {
+    if let Some(host) = host() {
+        // SAFETY: an open list.
+        unsafe { wait_for_all(host, list) };
+    }
+}
+
 /// The host copy of `[src, src + len)` if shaders write it: what it holds at
 /// a place in a list is not what title memory holds at submission.
 fn shaders_own(src: usize, len: usize) -> Option<std::sync::Arc<Shadow>> {

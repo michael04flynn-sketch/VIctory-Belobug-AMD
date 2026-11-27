@@ -393,6 +393,14 @@ pub(crate) fn fallback_heaps() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_FALLBACK_HEAPS").is_some_and(|v| v == "1"))
 }
 
+/// The host adapter's PCI vendor id (0 until the host is made).
+static VENDOR: AtomicU32 = AtomicU32::new(0);
+
+/// Whether the host adapter is Intel's.
+pub(crate) fn intel() -> bool {
+    VENDOR.load(Ordering::Relaxed) == 0x8086
+}
+
 pub(crate) fn keep_freed() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_FREED").is_none_or(|v| v != "0"))
@@ -1088,6 +1096,7 @@ fn create() -> windows::core::Result<Host> {
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
         if let Some(desc) = adapter.as_ref().and_then(|a| a.GetDesc1().ok()) {
+            VENDOR.store(desc.VendorId, Ordering::Relaxed);
             let name = String::from_utf16_lossy(&desc.Description);
             tracing::info!(
                 adapter = name.trim_end_matches('\0'),
@@ -3933,6 +3942,7 @@ mod card_steps;
 pub(crate) mod indirects;
 mod panel;
 mod place;
+pub(crate) use place::sync_all;
 pub(crate) mod rec;
 mod send;
 mod upq;

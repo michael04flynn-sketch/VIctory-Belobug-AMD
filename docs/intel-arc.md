@@ -333,15 +333,115 @@ reads it. `victory.exe shader-info -v` lists every shader by the hash a run's lo
 
 ### Settings to tell the causes apart
 
-`scripts\intel-sweep.ps1` runs these one after another (each up to `-Seconds`, default 180) and
-prints which ones survive: the launcher as it is; `-SkipFsr4` (the 17 FSR4 compute shaders and the 3
-that do not translate are skipped); `VICTORY_RELAY=0` (every submission waited for); `-MeshTest
-scissor` (mesh shaders run, one pixel rasterised) and `skip` (no mesh draws); `-Profile Lean`; and
-`VICTORY_UMA_HEADROOM=0`. It closes a run still alive at the limit and counts it as survived, and
-leaves a `sweep-<time>.txt` and one log with a memory timeline per run in `logs\`.
+`scripts\intel-sweep.ps1` runs settings one after another (each up to `-Seconds`, default 180) and
+prints which ones survive (`-List` shows them: `default`, `base`, `skip-fsr4`, `no-relay`,
+`mesh-scissor`, `mesh-skip`, `card-off`, `fallback-heaps`, `no-getdims`, `all-three`, `no-sweep`,
+`mesh-shadows-only`, `mesh-no-shadows`, `shadows-fence`, `shadows-zero`, `skip-40`, `gbv`, `lean`,
+`uma-off`). It closes a run still alive at the limit and counts it as survived when the game had got
+into the world (frames of 100 ms and more; a run that stayed at the front end at 30 fps says
+`no world` and proves nothing: 4 runs of one session did), and leaves a `sweep-<time>.txt` and
+one log with a memory timeline per run in `logs\`. `scripts\intel-mesh-bisect.ps1` halves the mesh
+shaders by the last digits of their hashes (`VICTORY_MESH_TEST=keep:<digits>[:<digits>]`).
+`VICTORY_MESH_TEST=only:<hash>,<hash>` draws just those mesh shaders.
+
+## The session of 2026-11-27, runs 11 to 40: what stops the card, and what does not
+
+26 of the 27 runs that issued the title's mesh draws ended in a hung device (0x887A0006; "device
+removed" 0x887A0005 with the debug layer) 56 to 147 s after the process started, soon after the
+world's first frames (the 27th ran a filter that kept only the shaders whose hashes end in 00, 10, 20
+or 30). The three runs with `-MeshTest skip` ran on to the limit in the world (187 s, 200 s and 200 s,
+frames 2835, 2577 and 1720, 17 GB private). So the launcher, and the host on an Intel adapter, skip
+mesh draws unless told otherwise (`-MeshTest off`, `VICTORY_MESH_TEST=off`): the world's meshes are
+missing, the run is stable.
+
+| Setting | What it tests | Result |
+|---|---|---|
+| `-SkipFsr4` | the FSR4 compute passes | hung, 73 s |
+| `VICTORY_RELAY=0` | submissions sent ahead, the copy-back thread | hung, 63 s |
+| `-MeshTest scissor` | what the mesh triangles cover (one pixel rasterised) | hung, 68 s |
+| `-MeshTest skip` (3 runs) | all mesh draws | **survived** 187 s, 200 s, 200 s |
+| debug layer, full device-removed data | validation errors, the stopped command | hung, 86 s; see below |
+| `VICTORY_CARD_BUFFERS=0`, `VICTORY_FALLBACK_HEAPS=1`, `VICTORY_NO_GETDIMS=1` together | the three findings of the debug layer, and `getDimensions` of a picked descriptor | hung, 123 s |
+| `VICTORY_SWEEP=0`, `VICTORY_TEXTURE_SWEEP=0` | host copies given back while a view still shows them | hung, 56 s |
+| `-MeshTest keep:0:4` (hash ends in 40: 6 mesh shaders) | the bisect's bucket, alone | hung, 2 runs |
+| `-SkipPipelines` of those six | a single bucket as the cause | hung, 65 s |
+| `-MeshTest only:` the four `MS_VS_CascadeShadows_draw` shaders | the simplest family: depth only, one position, 628 lines of DXIL | hung, 78 s |
+| `-SkipPipelines` of those four | | hung, 68 s |
+| shadow shaders only, a barrier on all work and memory after each dispatch (`VICTORY_MESH_FENCE=1`) | draws overlapping each other or other work | hung, 86 s |
+| shadow shaders only, dispatches with zero groups (`VICTORY_MESH_ZERO=1`) | the pipeline's state and bindings alone | **survived** 200 s |
+
+What follows from it:
+
+- **It is the mesh shaders running, not any one shader.** Any subset of them stops the card: the four
+  shadow shaders alone, everything but them, the bucket `40` alone, everything but it. The first
+  unfinished command of the device-removed data is a `DispatchMesh` (1 group of `45ace4127ac61cfd` in
+  two runs, with the dispatches before it done), an `ExecuteIndirect` of an indirect mesh draw
+  (kind 10), or the `CopyTextureRegion` that follows the barrier after such draws (the barrier before
+  it had finished, so the copy itself, or what it waits for, is what stopped); the list position is
+  the same in every run that draws the same shaders (command 27 of the list with
+  `MS_VS_BreakableGlassNoCrack` in five of the bisect's runs).
+- **Not the load**: 1,500 to 8,400 mesh groups a frame (the largest dispatch 216 groups), no
+  refusals by the indirect budget. Not rasterisation (one pixel), not the amount of overlap (a
+  barrier after every dispatch), not the order of events (no relay), not the FSR4 passes, not the
+  sampler heap, the card copies, the heap's `getDimensions`, nor anything let go early.
+- **Not the pipeline's state alone**: with zero groups everything is bound and set, and the run lives.
+  (The driver may skip an empty dispatch altogether, so this does not rule out the state changes that
+  go with a draw that runs.)
+- **The debug layer** (191 messages in the run) found three things, none the cause (the run with all
+  three put right still hung): `SetComputeRootSignature` before any sampler heap was bound, 114
+  times (id 1419; `VICTORY_FALLBACK_HEAPS=1` binds a heap of one slot); 59 root SRVs of "title buffer
+  ... on the card" read while still in `COPY_DEST` after the copy that fills them (id 538;
+  `VICTORY_CARD_BUFFERS=0` keeps the copies in the PC's memory); and one vertex draw whose viewport
+  (1920x1080) is larger than its target (1280x720; id 1378).
+  (Four compute pipelines of wave size 64 are refused by the driver, as expected.)
+- **GPU-based validation does not run the title**: with `VICTORY_D3D12_GBV=1` the title crashed 80 s in
+  (`victory-image-....dll+0x23cf683`, a write to address 0), before any validation message about a
+  shader.
+- **The standalone test** `crates\victory-gpu\tests\mesh_fuzz.rs` (`cargo test -p victory-gpu --test
+  mesh_fuzz -- --ignored --nocapture`, parameters in its header) dispatches the translator's own DXIL
+  of such a shader (`MESH_DXIL=<file>`, from `VICTORY_EMIT_DUMP` of `victory.exe translate
+  --validate`) on this GPU with the bindings the host gives it. It did not stop the card in any of: 40,000
+  lists of 40 one-group dispatches over each of garbage, small values, zeros and ones (6.4 million
+  dispatches); 20,000 lists with each of nine kinds of view in the tables (the right ones, never
+  written, a null texture, a null buffer, a texture, typed, structured, unordered access, kinds
+  crossed); the buffers in write-back PC memory with 4 and 12 CPU threads rewriting them while the
+  card reads; vertex draws between the mesh dispatches (root signature and pipeline switches, the
+  input assembler root flag); lists 250 ms apart for 100 s, and 120 ms apart for 65 s with 12 more
+  CPU threads busy. So the shader, its bindings, the data in them, the memory kind and the CPU's
+  writes are not enough. What the title's run has on top is not known (see below).
+
+Frame cost with the mesh draws skipped (world, 3 fps): 275 to 337 ms a frame, of which 43 to 74 ms
+preparing, 85 to 122 ms on the GPU and 73 to 145 ms copying back 41 to 44 MB of what the GPU wrote;
+17 GB private. The copy-back and the GPU time are where a frame goes, not the CPU's threads.
+
+The three launcher profiles in that stable mode (one run each, 220 s, 5-second statistics of the
+world's frames, 2026-11-27 14:01 to 14:13; the scene is the same, the numbers vary between runs by a
+third either way):
+
+| Profile | Card buffers | ms a frame, median (mean) | RAM free at the end |
+|---|---|---|---|
+| Lean | 128 MB | 545 (801); copying back 303, preparing 288 | 1.8 GB |
+| Balanced (default) | 512 MB | 136 (294) | 2.1 GB |
+| Fast | 1024 MB | 125 (174) | 1.0 GB |
+
+Lean is the slow one: with fewer title buffers on the card the CPU compares and copies them instead.
+Fast is a little quicker than Balanced and leaves the PC 1 GB, which a browser can take: Balanced stays
+the default.
 
 ## Not known yet
 
+- What the title's run has that the standalone test has not, and the hang needs: several queues at
+  once (the copy queues for textures and uploads), the real depth and colour targets (`D32_S8`,
+  `R16G16B16A16F` at 1280x720) and their pipelines' state, the pixel shaders, thousands of different
+  pipelines, real meshlet data, a view heap with a million views written, memory at 17 GB. The next
+  step is to add them to `mesh_fuzz.rs` one at a time, or to capture the list that stops
+  (`docs/replay.md`: too large in the world so far) and replay it standalone.
+- Whether a newer Intel graphics driver (8724 is from 2026-04) takes mesh shaders that this one does
+  not. The device-removed data names no page-fault address on this vendor.
+- `MS` programs write the declared maxima of vertices and primitives every time
+  (`SetMeshOutputCounts(128, 128)`, then culled triangles for the lanes past the real count): the
+  console's own counts could be passed instead, which also saves the GPU the empty primitives; whether
+  it matters here is untested.
 - Whether the process itself or other programs took the RAM (the `.mem.csv` of the next run).
 - Which title memory kinds block `-InPlace` (`-Probe` logs a census 30 s and 150 s in).
 - Whether any change to the buffer-copy pass is needed or safe.
