@@ -59,6 +59,14 @@ param(
     # the CPU (VICTORY_CARD_BUFFERS_MB). It was 128 (a memory saving); 512 is the layer's own value
     # for budgets up to 12 GiB. Each MB is system memory on this GPU, written buffers twice.
     [int]$CardBuffersMB = 512,
+    # Which way to trade CPU time against memory (each sets -CardBuffersMB and -TextureCapMB unless
+    # you pass them): Lean 128 / 768 (least memory, most CPU compare work, fewest texture copies),
+    # Balanced 512 / 1024 (the default), Fast 1024 / 1536 (the most card buffers, the most memory).
+    # A card copy of a title buffer costs a CPU-side copy and a card-side copy (and a third, "before",
+    # for one shaders write): on this GPU all of it is system memory. Measured: the 1024 cap took
+    # title-filled texture copies from 2,451 MB to 1,039 MB. The buffer-memory figures are from the
+    # code's own description, not measured here.
+    [ValidateSet('Lean', 'Balanced', 'Fast')][string]$Profile = 'Balanced',
     # Shader hashes (16 hex digits, comma separated; diag build) whose draws are skipped
     # (VICTORY_SKIP_PIPELINES): to test whether one pipeline is the one that hangs the device.
     [string]$SkipPipelines,
@@ -66,6 +74,16 @@ param(
     [string]$LogDir,
     [switch]$NoLog
 )
+
+$profiles = @{
+    Lean     = @{ CardBuffersMB = 128;  TextureCapMB = 768 }
+    Balanced = @{ CardBuffersMB = 512;  TextureCapMB = 1024 }
+    Fast     = @{ CardBuffersMB = 1024; TextureCapMB = 1536 }
+}
+foreach ($name in 'CardBuffersMB', 'TextureCapMB') {
+    if (-not $PSBoundParameters.ContainsKey($name)) { Set-Variable -Name $name -Value $profiles[$Profile][$name] }
+}
+Write-Host "Profile $Profile`: card buffers $CardBuffersMB MB, title-filled texture copies capped at $TextureCapMB MB."
 
 # Memory knobs (values in MB unless the name says KB). Each one lowers how much is kept
 # ready at once, at the cost of textures arriving a little later.
@@ -259,6 +277,15 @@ if ($logPath -and (Test-Path $logPath)) {
     $cmp = [regex]::Matches($t, '([\d.]+) MB in \d+ ranges of title buffers. copies')
     if ($busy.Count) { Write-Host "Last frame statistics: card about $($busy[$busy.Count - 1].Groups[2].Value) % busy, idle $($busy[$busy.Count - 1].Groups[1].Value) ms a frame." }
     if ($cmp.Count) { Write-Host "  title buffer copies compared on the CPU: $($cmp[$cmp.Count - 1].Groups[1].Value) MB a frame (more of them on the card with -CardBuffersMB)." }
+}
+# The memory timeline's extremes (the RAM figures to set against another profile).
+if ($memPath -and (Test-Path $memPath)) {
+    $rows = @(Import-Csv $memPath)
+    if ($rows.Count) {
+        $minFree = ($rows | ForEach-Object { [int]$_.free_ram_mb } | Measure-Object -Minimum).Minimum
+        $peakWs = ($rows | Where-Object { $_.victory_ws_mb } | ForEach-Object { [int]$_.victory_ws_mb } | Measure-Object -Maximum).Maximum
+        Write-Host ("Memory: lowest free RAM {0:N1} GB, peak victory.exe working set {1:N1} GB." -f ($minFree / 1024), ($peakWs / 1024))
+    }
 }
 # What the run said about why the device went (the exit code only says that it did).
 if ($logPath -and (Test-Path $logPath)) {
