@@ -128,6 +128,11 @@ pub(crate) fn set_uma(uma: bool) {
     UMA.store(uma, Ordering::Relaxed);
 }
 
+/// Whether the GPU shares the PC's memory (false until the host has said).
+pub(crate) fn uma() -> bool {
+    UMA.load(Ordering::Relaxed)
+}
+
 /// On a shared-memory GPU the card's memory is the PC's memory: the first world frame of the
 /// title adds several GB of card and buffer copies in one go, between two once-a-second looks
 /// (run of 2026-11-27: free RAM fell from 17.9 GB to 2.9 GB inside frame 1217, the pressure

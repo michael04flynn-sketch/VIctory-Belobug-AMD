@@ -1754,12 +1754,17 @@ pub(crate) fn host_made<'a>(
 /// Unconditional host-texture floor for a given local VRAM budget (`None` when
 /// the adapter does not report one): up to 2 GiB, capped at a quarter of the
 /// reported budget so 4–6 GiB cards do not bypass the budget check early.
+///
+/// On a shared-memory GPU (`uma`) the floor is 1 GiB: its card memory is the PC's memory and the
+/// first world frame adds some 2.8 GB of buffer copies on top of what the queue has made (two
+/// runs on an Arc B390, 2026-11-27: card use went from 5.4 GB to 8.1 GB of a budget that fell
+/// to 8.1 GB, and the card then refused memory). `VICTORY_TEXTURE_FLOOR_MB` sets it outright.
 #[cfg(any(windows, test))]
-fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
-    const MAX_FLOOR: u64 = 2 << 30;
+fn texture_floor_bytes(vram_budget: Option<u64>, uma: bool) -> u64 {
+    let max_floor: u64 = if uma { 1 << 30 } else { 2 << 30 };
     match vram_budget {
-        Some(budget) => MAX_FLOOR.min(budget / 4),
-        None => MAX_FLOOR,
+        Some(budget) => max_floor.min(budget / 4),
+        None => max_floor,
     }
 }
 
@@ -1785,7 +1790,12 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     if let Some(limit) = limit {
         return filled < limit;
     }
-    let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget));
+    static FLOOR_MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let floor_mb = *FLOOR_MB.get_or_init(|| std::env::var("VICTORY_TEXTURE_FLOOR_MB").ok()?.trim().parse::<u64>().ok());
+    let floor = floor_mb.map_or_else(
+        || texture_floor_bytes(memory.map(|[budget, ..]| budget), crate::residency::uma()),
+        |mb| mb << 20,
+    );
     if filled < floor {
         return true;
     }
@@ -4641,13 +4651,17 @@ float4 lit() : SV_Target { return 1.0; }
     #[test]
     fn texture_floor_scales_with_vram_budget() {
         const GIB: u64 = 1 << 30;
-        assert_eq!(texture_floor_bytes(None), 2 * GIB);
-        assert_eq!(texture_floor_bytes(Some(4 * GIB)), GIB);
-        assert_eq!(texture_floor_bytes(Some(6 * GIB)), 6 * GIB / 4);
-        assert_eq!(texture_floor_bytes(Some(8 * GIB)), 2 * GIB);
-        assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
-        assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
-        assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+        assert_eq!(texture_floor_bytes(None, false), 2 * GIB);
+        assert_eq!(texture_floor_bytes(Some(4 * GIB), false), GIB);
+        assert_eq!(texture_floor_bytes(Some(6 * GIB), false), 6 * GIB / 4);
+        assert_eq!(texture_floor_bytes(Some(8 * GIB), false), 2 * GIB);
+        assert_eq!(texture_floor_bytes(Some(12 * GIB), false), 2 * GIB);
+        assert_eq!(texture_floor_bytes(Some(24 * GIB), false), 2 * GIB);
+        assert_eq!(texture_floor_bytes(Some(32 * GIB), false), 2 * GIB);
+        // A shared-memory GPU gets 1 GiB, still capped at a quarter of its budget.
+        assert_eq!(texture_floor_bytes(Some(9 * GIB), true), GIB);
+        assert_eq!(texture_floor_bytes(Some(2 * GIB), true), GIB / 2);
+        assert_eq!(texture_floor_bytes(None, true), GIB);
     }
 
     /// A placed texture viewed from a later level has a host copy of that
